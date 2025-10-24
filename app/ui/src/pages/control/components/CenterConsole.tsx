@@ -56,7 +56,6 @@ const renderMasterPreviewLayer = (
         key={videoKey}
         className="master-preview-layer"
         muted
-        loop
         playsInline
         preload="auto"
         ref={masterPreviewRefs[deckKey]}

@@ -54,23 +54,33 @@ export interface ControlSettings {
   prompt: string;
 }
 
-export interface DeckMediaStatus {
+export interface DeckTimelineState {
+  src: string | null;
   isPlaying: boolean;
-  progress: number;
+  basePosition: number;
+  position: number;
+  playRate: number;
+  updatedAt: number;
+  version: number;
   isLoading: boolean;
   error: boolean;
-  src: string | null;
+  duration: number | null;
 }
 
-export const createDefaultDeckMediaStatus = (): DeckMediaStatus => ({
+export const createDefaultDeckTimelineState = (): DeckTimelineState => ({
+  src: null,
   isPlaying: false,
-  progress: 0,
+  basePosition: 0,
+  position: 0,
+  playRate: 1,
+  updatedAt: 0,
+  version: 0,
   isLoading: false,
   error: false,
-  src: null,
+  duration: null,
 });
 
-export type DeckMediaStatusMap = Record<DeckKey, DeckMediaStatus>;
+export type DeckTimelineStateMap = Record<DeckKey, DeckTimelineState>;
 
 export interface ViewerStatus {
   isRunning: boolean;
@@ -87,9 +97,19 @@ export interface StartVisualizationPayload {
   prompt: string;
 }
 
-export interface DeckMediaStateMessagePayload {
+export type DeckMediaStateIntent =
+  | { intent: 'toggle'; isPlaying?: boolean }
+  | { intent: 'play' }
+  | { intent: 'pause' }
+  | { intent: 'seek'; position?: number; value?: number; resume?: boolean }
+  | { intent: 'rate' | 'speed'; value: number }
+  | { intent: 'source' | 'src'; src?: string | null; value?: string | null }
+  | { intent: 'state'; value: Partial<DeckTimelineState> }
+  | Partial<DeckTimelineState>;
+
+export interface DeckMediaStateMessagePayload<TState = DeckTimelineState> {
   deck: DeckKey;
-  state: DeckMediaStatus;
+  state: TState;
 }
 
 export type RTCSignalType = 'offer' | 'answer' | 'ice-candidate' | 'request-offer';
@@ -112,7 +132,7 @@ export type OutboundMessage =
   | { type: 'set-audio-sensitivity'; payload: { value: number } }
   | { type: 'viewer-status'; payload: Partial<ViewerStatus> }
   | { type: 'code-progress'; payload: { code: string; isComplete: boolean } }
-  | { type: 'deck-media-state'; payload: DeckMediaStateMessagePayload }
+  | { type: 'deck-media-state'; payload: DeckMediaStateMessagePayload<DeckMediaStateIntent> }
   | RTCSignalMessage;
 
 export type InboundMessage =
@@ -124,7 +144,7 @@ export type InboundMessage =
           controlSettings: ControlSettings;
           viewerStatus: ViewerStatus;
           mixState: MixState;
-          deckMediaStates?: DeckMediaStatusMap;
+          deckMediaStates?: DeckTimelineStateMap;
         };
         assets: FallbackAssets;
       };

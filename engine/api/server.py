@@ -183,17 +183,21 @@ class RealtimeManager:
             payload = message.get("payload") or {}
             deck = payload.get("deck")
             state_payload = payload.get("state") or {}
-            if deck and self.state.update_deck_media_state(deck, state_payload):
-                await self.broadcast(
-                    {
+            if deck:
+                did_change = self.state.update_deck_media_state(deck, state_payload)
+                state = self.state.deck_media_states.get(deck)
+                if state:
+                    message_payload = {
                         "type": "deck-media-state",
                         "payload": {
                             "deck": deck,
-                            "state": self.state.deck_media_states[deck].to_dict(),
+                            "state": state.to_dict(),
                         },
-                    },
-                    exclude=websocket,
-                )
+                    }
+                    if did_change:
+                        await self.broadcast(message_payload)
+                    else:
+                        await websocket.send_json(message_payload)
             return
 
         if message_type == "rtc-signal":

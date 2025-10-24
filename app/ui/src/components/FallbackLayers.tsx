@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react';
 import GlslCanvas from 'glslCanvas';
 import type { AudioAnalysis } from '../modules/AudioInput';
 import type { CSSProperties } from 'react';
-import type { DeckMediaStatus } from '../types/realtime';
+import type { DeckTimelineState } from '../types/realtime';
 
 type BlendMode = 'normal' | 'screen' | 'add' | 'multiply' | 'overlay';
 
@@ -19,7 +19,7 @@ interface VideoLayerProps {
   src: string;
   opacity: number;
   blendMode?: BlendMode;
-  mediaState?: DeckMediaStatus;
+  mediaState?: DeckTimelineState;
 }
 
 export function VideoFallbackLayer({ id, src, opacity, blendMode, mediaState }: VideoLayerProps) {
@@ -74,7 +74,7 @@ export function VideoFallbackLayer({ id, src, opacity, blendMode, mediaState }: 
       return;
     }
 
-    if (!mediaState.isPlaying && !shouldPlay) {
+    if (!mediaState.isPlaying || !shouldPlay) {
       try {
         video.pause();
       } catch {
@@ -85,25 +85,37 @@ export function VideoFallbackLayer({ id, src, opacity, blendMode, mediaState }: 
 
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || mediaState?.progress == null) {
+    if (!video || !mediaState) {
       return;
     }
 
-    const clampProgress = (value: number) => Math.max(0, Math.min(100, value));
-    const syncProgress = () => {
+    const nowSeconds = Date.now() / 1000;
+    const basePosition = Number.isFinite(mediaState.basePosition)
+      ? mediaState.basePosition
+      : 0;
+    const playRate = Number.isFinite(mediaState.playRate) ? mediaState.playRate : 1;
+    const updatedAt = Number.isFinite(mediaState.updatedAt) ? mediaState.updatedAt : nowSeconds;
+    const elapsed = mediaState.isPlaying ? Math.max(0, nowSeconds - updatedAt) : 0;
+    const fallbackPosition = Number.isFinite(mediaState.position) ? mediaState.position : 0;
+    const targetSeconds = mediaState.isPlaying
+      ? Math.max(0, basePosition + elapsed * playRate)
+      : Math.max(0, fallbackPosition);
+
+    const syncCurrentTime = () => {
       const duration = video.duration;
-      if (!Number.isFinite(duration) || duration <= 0) {
-        return;
-      }
-      const targetPercent = clampProgress(mediaState.progress);
-      const targetTime = (targetPercent / 100) * duration;
-      if (!Number.isFinite(targetTime)) {
-        return;
-      }
-      const tolerance = Math.max(0.2, duration * 0.02);
-      if (Math.abs(video.currentTime - targetTime) > tolerance) {
+      if (Number.isFinite(duration) && duration > 0) {
+        const clampedTarget = Math.min(targetSeconds, duration);
+        const tolerance = Math.max(0.2, duration * 0.02);
+        if (Math.abs(video.currentTime - clampedTarget) > tolerance) {
+          try {
+            video.currentTime = clampedTarget;
+          } catch {
+            // ignore seek errors
+          }
+        }
+      } else {
         try {
-          video.currentTime = targetTime;
+          video.currentTime = targetSeconds;
         } catch {
           // ignore seek errors
         }
@@ -111,19 +123,35 @@ export function VideoFallbackLayer({ id, src, opacity, blendMode, mediaState }: 
     };
 
     if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
-      syncProgress();
+      syncCurrentTime();
       return;
     }
 
     const handleLoadedMetadata = () => {
-      syncProgress();
+      syncCurrentTime();
     };
 
     video.addEventListener('loadedmetadata', handleLoadedMetadata);
     return () => {
       video.removeEventListener('loadedmetadata', handleLoadedMetadata);
     };
-  }, [mediaState?.progress, resolvedSrc]);
+  }, [mediaState, resolvedSrc]);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !mediaState) {
+      return;
+    }
+
+    const desiredRate = Number.isFinite(mediaState.playRate) ? mediaState.playRate : 1;
+    if (Math.abs(video.playbackRate - desiredRate) > 0.01) {
+      try {
+        video.playbackRate = desiredRate;
+      } catch {
+        // ignore playback rate errors
+      }
+    }
+  }, [mediaState, resolvedSrc]);
 
   return (
     <video

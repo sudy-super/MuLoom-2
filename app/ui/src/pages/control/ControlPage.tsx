@@ -71,19 +71,25 @@ const ControlPage = () => {
     c: null,
     d: null,
   });
-  const [desiredDeckPlayback, setDesiredDeckPlayback] = useState<Record<DeckKey, boolean>>({
-    a: false,
-    b: false,
-    c: false,
-    d: false,
-  });
-  const desiredDeckPlaybackRef = useRef(desiredDeckPlayback);
   const [dropTargetDeck, setDropTargetDeck] = useState<DeckKey | null>(null);
   const [activeContentTab, setActiveContentTab] = useState<ContentTab>('generative');
   const [selectedAssetValue, setSelectedAssetValue] = useState<string | null>(null);
   const [rtcSignalQueue, setRtcSignalQueue] = useState<RTCSignalMessage[]>([]);
 
-  const { connectionState, viewerStatus, send, controlSettings, assets, mixState } = useRealtime('controller', {
+  const {
+    connectionState,
+    viewerStatus,
+    send,
+    controlSettings,
+    assets,
+    mixState,
+    deckMediaStates: remoteDeckMediaStates,
+    requestDeckToggle,
+    requestDeckSeek,
+    requestDeckRate,
+    requestDeckSource,
+    requestDeckState,
+  } = useRealtime('controller', {
     onCodeProgress: (progress) => {
       setLatestCode(progress.code);
       setIsGenerating(!progress.isComplete);
@@ -95,12 +101,15 @@ const ControlPage = () => {
     },
   });
 
-  const decks: Record<DeckKey, MixDeck> = {
-    a: mixState?.decks?.a ?? { ...emptyDeck },
-    b: mixState?.decks?.b ?? { ...emptyDeck },
-    c: mixState?.decks?.c ?? { ...emptyDeck },
-    d: mixState?.decks?.d ?? { ...emptyDeck },
-  };
+  const decks: Record<DeckKey, MixDeck> = useMemo(
+    () => ({
+      a: mixState?.decks?.a ?? { ...emptyDeck },
+      b: mixState?.decks?.b ?? { ...emptyDeck },
+      c: mixState?.decks?.c ?? { ...emptyDeck },
+      d: mixState?.decks?.d ?? { ...emptyDeck },
+    }),
+    [mixState?.decks?.a, mixState?.decks?.b, mixState?.decks?.c, mixState?.decks?.d],
+  );
 
   const currentRtcSignal = rtcSignalQueue.length > 0 ? rtcSignalQueue[0] : null;
 
@@ -115,37 +124,15 @@ const ControlPage = () => {
     });
   }, [connectionState, send]);
 
-  const deckHasVideo = useMemo(
-    () => ({
-      a: decks.a.type === 'video' && Boolean(decks.a.assetId),
-      b: decks.b.type === 'video' && Boolean(decks.b.assetId),
-      c: decks.c.type === 'video' && Boolean(decks.c.assetId),
-      d: decks.d.type === 'video' && Boolean(decks.d.assetId),
-    }),
-    [
-      decks.a.type,
-      decks.a.assetId,
-      decks.b.type,
-      decks.b.assetId,
-      decks.c.type,
-      decks.c.assetId,
-      decks.d.type,
-      decks.d.assetId,
-    ],
-  );
-
   const deckVideoRefCallbacks = useMemo(
     () =>
       deckKeys.reduce((accumulator, key) => {
         accumulator[key] = (element: HTMLVideoElement | null) => {
           registerVideo(`deck-${key}`, element);
-          if (element && desiredDeckPlaybackRef.current[key]) {
-            void playVideo(`deck-${key}`);
-          }
         };
         return accumulator;
       }, {} as Record<DeckKey, (element: HTMLVideoElement | null) => void>),
-    [playVideo, registerVideo],
+    [registerVideo],
   );
 
   const masterPreviewVideoRefCallbacks = useMemo(
@@ -153,30 +140,25 @@ const ControlPage = () => {
       deckKeys.reduce((accumulator, key) => {
         accumulator[key] = (element: HTMLVideoElement | null) => {
           registerVideo(`master-${key}`, element);
-          if (element && desiredDeckPlaybackRef.current[key]) {
-            void playVideo(`master-${key}`);
-          }
         };
         return accumulator;
       }, {} as Record<DeckKey, (element: HTMLVideoElement | null) => void>),
-    [playVideo, registerVideo],
+    [registerVideo],
   );
 
-  const broadcastDeckMediaState = useCallback(
-    (deckKey: DeckKey, state: DeckMediaState) => {
-      send({
-        type: 'deck-media-state',
-        payload: {
-          deck: deckKey,
-          state: {
-            ...state,
-            src: state.src ?? null,
-          },
-        },
-      });
-    },
-    [send],
-  );
+  const deckDurationsRef = useRef<Record<DeckKey, number>>({
+    a: 0,
+    b: 0,
+    c: 0,
+    d: 0,
+  });
+
+  const reportedDeckSrcRef = useRef<Record<DeckKey, string | null>>({
+    a: null,
+    b: null,
+    c: null,
+    d: null,
+  });
 
   const consumeRtcSignal = useCallback(() => {
     setRtcSignalQueue((previous) => {
@@ -214,32 +196,43 @@ const ControlPage = () => {
   }, [viewerStatus]);
 
   useEffect(() => {
-    desiredDeckPlaybackRef.current = desiredDeckPlayback;
-  }, [desiredDeckPlayback]);
-
-  useEffect(() => {
     const unsubscribes = deckKeys.map((deckKey) => {
       const deckId = `deck-${deckKey}`;
-      const masterId = `master-${deckKey}`;
 
       return addEventListener(deckId, (state, details) => {
-        let nextStateForBroadcast: DeckMediaState | null = null;
+        const managerState = getState(deckId);
+
+        const durationDetail =
+          typeof details?.duration === 'number' && Number.isFinite(details.duration)
+            ? details.duration
+            : undefined;
+        if (durationDetail && durationDetail > 0) {
+          deckDurationsRef.current[deckKey] = durationDetail;
+          const remoteDuration = remoteDeckMediaStates[deckKey]?.duration ?? null;
+          if (
+            !remoteDuration ||
+            !Number.isFinite(remoteDuration) ||
+            Math.abs(remoteDuration - durationDetail) > 0.25
+          ) {
+            requestDeckState(deckKey, { intent: 'state', value: { duration: durationDetail } });
+          }
+        }
+
         setDeckStates((previous) => {
           const current = previous[deckKey] ?? createDefaultDeckMediaState()[deckKey];
           const progressDetail =
-            typeof details?.progress === 'number' ? (details.progress as number) : current.progress;
+            typeof details?.progress === 'number' ? Number(details.progress) : current.progress;
           const clampedProgress = Math.max(0, Math.min(100, progressDetail));
-          const normalizeSrc = (value: unknown) => {
+          const normaliseSrc = (value: unknown) => {
             if (typeof value !== 'string') {
               return null;
             }
             const trimmed = value.trim();
             return trimmed.length > 0 ? trimmed : null;
           };
-          const detailSrc = normalizeSrc(details?.src);
-          const managerState = getState(deckId);
-          const managerSrc = normalizeSrc(managerState.src);
-          const currentSrc = normalizeSrc(current.src);
+          const detailSrc = normaliseSrc(details?.src);
+          const managerSrc = normaliseSrc(managerState.src);
+          const currentSrc = normaliseSrc(current.src);
           const nextSrc = detailSrc ?? managerSrc ?? currentSrc ?? null;
           const nextState: DeckMediaState = {
             isPlaying: state === 'playing',
@@ -257,40 +250,25 @@ const ControlPage = () => {
           ) {
             return previous;
           }
-          nextStateForBroadcast = nextState;
           return {
             ...previous,
             [deckKey]: nextState,
           };
         });
 
-        if (nextStateForBroadcast) {
-          broadcastDeckMediaState(deckKey, nextStateForBroadcast);
-        }
-
-        if (state === 'ready' && desiredDeckPlaybackRef.current[deckKey]) {
-          void playVideo(deckId);
-          void playVideo(masterId);
-        }
-
-        if (state === 'playing' || state === 'paused') {
-          const progressDetail =
-            typeof details?.progress === 'number'
-              ? (details.progress as number)
-              : getState(deckId).progress;
-          const clampedProgress = Math.max(0, Math.min(100, progressDetail));
-          seekToPercent(masterId, clampedProgress);
-          if (state === 'playing') {
-            void playVideo(masterId);
-          } else {
-            pauseVideo(masterId);
-          }
-        }
-
-        if (state === 'playing') {
-          setDesiredDeckPlayback((previous) =>
-            previous[deckKey] ? previous : { ...previous, [deckKey]: true },
-          );
+        const candidateSrc =
+          typeof details?.src === 'string' && details.src.trim().length > 0
+            ? details.src.trim()
+            : typeof managerState.src === 'string'
+              ? managerState.src
+              : null;
+        if (
+          candidateSrc &&
+          candidateSrc !== reportedDeckSrcRef.current[deckKey] &&
+          candidateSrc !== (remoteDeckMediaStates[deckKey]?.src ?? null)
+        ) {
+          reportedDeckSrcRef.current[deckKey] = candidateSrc;
+          requestDeckSource(deckKey, candidateSrc);
         }
       });
     });
@@ -298,62 +276,57 @@ const ControlPage = () => {
     return () => {
       unsubscribes.forEach((unsubscribe) => unsubscribe());
     };
-  }, [addEventListener, broadcastDeckMediaState, getState, pauseVideo, playVideo, seekToPercent]);
+  }, [addEventListener, getState, remoteDeckMediaStates, requestDeckSource, requestDeckState]);
 
   useEffect(() => {
     let cancelled = false;
 
+    const resolveAssetSrc = (deckKey: DeckKey): string | null => {
+      const deck = decks[deckKey];
+      if (!deck || deck.type !== 'video' || !deck.assetId) {
+        return null;
+      }
+      const asset =
+        assets.videos.find((item) => item.id === deck.assetId) ??
+        assets.overlays?.find((item) => item.id === deck.assetId);
+      if (asset && 'url' in asset && typeof asset.url === 'string') {
+        return asset.url;
+      }
+      return null;
+    };
+
     const loadDecks = async () => {
       for (const deckKey of deckKeys) {
-        const deck = decks[deckKey];
         const deckId = `deck-${deckKey}`;
         const masterId = `master-${deckKey}`;
+        const remoteState = remoteDeckMediaStates[deckKey];
+        const targetSrc = remoteState?.src ?? resolveAssetSrc(deckKey);
 
         try {
-          if (deck?.type === 'video' && deck.assetId) {
-            const video =
-              assets.videos.find((item) => item.id === deck.assetId) ??
-              assets.overlays?.find((item) => item.id === deck.assetId);
+          const deckManagerState = getState(deckId);
+          const masterManagerState = getState(masterId);
 
-            if (video && 'url' in video) {
-              const shouldPlay = desiredDeckPlaybackRef.current[deckKey];
-
-              if (shouldPlay) {
-                void playVideo(deckId);
-                void playVideo(masterId);
-              }
-
-              await loadSource(deckId, video.url);
+          if (targetSrc) {
+            if (deckManagerState.src !== targetSrc) {
+              await loadSource(deckId, targetSrc);
               if (cancelled) return;
-              await loadSource(masterId, video.url);
+            }
+            if (masterManagerState.src !== targetSrc) {
+              await loadSource(masterId, targetSrc);
               if (cancelled) return;
-
-              if (shouldPlay) {
-                const deckManagerState = getState(deckId);
-                const masterManagerState = getState(masterId);
-
-                if (deckManagerState.state !== 'playing' && !deckManagerState.pendingPlay) {
-                  void playVideo(deckId);
-                }
-                if (masterManagerState.state !== 'playing' && !masterManagerState.pendingPlay) {
-                  void playVideo(masterId);
-                }
-              } else {
-                pauseVideo(deckId);
-                pauseVideo(masterId);
-              }
-              continue;
+            }
+          } else {
+            if (deckManagerState.src) {
+              await loadSource(deckId, null);
+              if (cancelled) return;
+            }
+            if (masterManagerState.src) {
+              await loadSource(masterId, null);
+              if (cancelled) return;
             }
           }
-
-          await loadSource(deckId, null);
-          if (cancelled) return;
-          await loadSource(masterId, null);
-          if (cancelled) return;
-          pauseVideo(deckId);
-          pauseVideo(masterId);
         } catch (error) {
-          console.error(`Error loading deck ${deckKey}`, error);
+          console.error(`Error preparing deck ${deckKey}`, error);
         }
 
         if (cancelled) {
@@ -367,24 +340,74 @@ const ControlPage = () => {
     return () => {
       cancelled = true;
     };
-  }, [assets.overlays, assets.videos, decks, getState, loadSource, pauseVideo, playVideo]);
+  }, [assets.overlays, assets.videos, decks, getState, loadSource, remoteDeckMediaStates]);
 
   useEffect(() => {
-    deckKeys.forEach((deckKey) => {
-      const deck = decks[deckKey];
-      const shouldPlay = desiredDeckPlayback[deckKey];
-      const deckId = `deck-${deckKey}`;
-      const masterId = `master-${deckKey}`;
+    const nowSeconds = Date.now() / 1000;
 
-      if (!deck || deck.type !== 'video' || !deck.assetId) {
-        pauseVideo(deckId);
-        pauseVideo(masterId);
+    deckKeys.forEach((deckKey) => {
+      const remoteState = remoteDeckMediaStates[deckKey];
+      if (!remoteState) {
         return;
       }
 
+      if (
+        remoteState.duration &&
+        Number.isFinite(remoteState.duration) &&
+        remoteState.duration > 0
+      ) {
+        deckDurationsRef.current[deckKey] = remoteState.duration;
+      }
+
+      const deckId = `deck-${deckKey}`;
+      const masterId = `master-${deckKey}`;
       const deckManagerState = getState(deckId);
       const masterManagerState = getState(masterId);
 
+      const basePosition = Number.isFinite(remoteState.basePosition)
+        ? remoteState.basePosition
+        : 0;
+      const playRate = Number.isFinite(remoteState.playRate) ? remoteState.playRate : 1;
+      const updatedAt = Number.isFinite(remoteState.updatedAt)
+        ? remoteState.updatedAt
+        : nowSeconds;
+      const elapsed = remoteState.isPlaying ? Math.max(0, nowSeconds - updatedAt) : 0;
+      const targetPosition = Math.max(0, basePosition + elapsed * playRate);
+
+      const knownDuration = deckDurationsRef.current[deckKey];
+      if (knownDuration && Number.isFinite(knownDuration) && knownDuration > 0) {
+        const rawPercent = (targetPosition / knownDuration) * 100;
+        const targetPercent = Math.max(0, Math.min(100, rawPercent));
+        if (Number.isFinite(targetPercent)) {
+          if (
+            typeof deckManagerState.progress === 'number' &&
+            Math.abs(deckManagerState.progress - targetPercent) > 1.5
+          ) {
+            seekToPercent(deckId, targetPercent);
+          }
+          if (
+            typeof masterManagerState.progress === 'number' &&
+            Math.abs(masterManagerState.progress - targetPercent) > 1.5
+          ) {
+            seekToPercent(masterId, targetPercent);
+          }
+        }
+      }
+
+      if (
+        Number.isFinite(playRate) &&
+        Math.abs((deckManagerState.playbackRate ?? 1) - playRate) > 0.01
+      ) {
+        setPlaybackRate(deckId, playRate);
+      }
+      if (
+        Number.isFinite(playRate) &&
+        Math.abs((masterManagerState.playbackRate ?? 1) - playRate) > 0.01
+      ) {
+        setPlaybackRate(masterId, playRate);
+      }
+
+      const shouldPlay = remoteState.isPlaying && Boolean(remoteState.src);
       if (shouldPlay) {
         if (deckManagerState.state !== 'playing' && !deckManagerState.pendingPlay) {
           void playVideo(deckId);
@@ -401,24 +424,69 @@ const ControlPage = () => {
         }
       }
     });
-  }, [decks, desiredDeckPlayback, getState, pauseVideo, playVideo]);
+  }, [getState, pauseVideo, playVideo, remoteDeckMediaStates, seekToPercent, setPlaybackRate]);
 
   useEffect(() => {
-    setDesiredDeckPlayback((previous) => {
+    const nowSeconds = Date.now() / 1000;
+    setDeckStates((previous) => {
       let didChange = false;
-      const next: Record<DeckKey, boolean> = { ...previous };
+      const next = { ...previous };
+
       deckKeys.forEach((deckKey) => {
-        if (!deckHasVideo[deckKey]) {
-          if (next[deckKey]) {
-            next[deckKey] = false;
-            didChange = true;
+        const remoteState = remoteDeckMediaStates[deckKey];
+        if (!remoteState) {
+          return;
+        }
+        const current = previous[deckKey] ?? createDefaultDeckMediaState()[deckKey];
+        const duration = deckDurationsRef.current[deckKey] || remoteState.duration || 0;
+        let progress = current.progress;
+        if (duration && Number.isFinite(duration) && duration > 0) {
+          const basePosition = Number.isFinite(remoteState.basePosition)
+            ? remoteState.basePosition
+            : 0;
+          const playRate = Number.isFinite(remoteState.playRate) ? remoteState.playRate : 1;
+          const updatedAt = Number.isFinite(remoteState.updatedAt)
+            ? remoteState.updatedAt
+            : nowSeconds;
+          const elapsed = remoteState.isPlaying ? Math.max(0, nowSeconds - updatedAt) : 0;
+          const position = Math.max(0, basePosition + elapsed * playRate);
+          const percent = (position / duration) * 100;
+          if (Number.isFinite(percent)) {
+            progress = Math.max(0, Math.min(100, percent));
           }
         }
+
+        const nextState: DeckMediaState = {
+          isPlaying: remoteState.isPlaying,
+          progress,
+          isLoading: remoteState.isLoading,
+          error: remoteState.error,
+          src: remoteState.src ?? current.src ?? null,
+        };
+
+        if (
+          current.isPlaying !== nextState.isPlaying ||
+          Math.abs(current.progress - nextState.progress) > 0.5 ||
+          current.isLoading !== nextState.isLoading ||
+          current.error !== nextState.error ||
+          current.src !== nextState.src
+        ) {
+          didChange = true;
+          next[deckKey] = nextState;
+        }
       });
+
       return didChange ? next : previous;
     });
-  }, [deckHasVideo]);
+  }, [remoteDeckMediaStates]);
 
+  useEffect(() => {
+    deckKeys.forEach((deckKey) => {
+      if (!remoteDeckMediaStates[deckKey]?.src) {
+        reportedDeckSrcRef.current[deckKey] = null;
+      }
+    });
+  }, [remoteDeckMediaStates]);
   useEffect(() => {
     deckKeys.forEach((deckKey) => {
       const deck = decks[deckKey];
@@ -428,10 +496,18 @@ const ControlPage = () => {
       const localSlider = localSensitivityValues[deckKey] ?? 50;
       const multiplier =
         mapSliderToSensitivity(localSlider) ?? clampSensitivityValue(audioSensitivity);
-      setPlaybackRate(`deck-${deckKey}`, multiplier);
-      setPlaybackRate(`master-${deckKey}`, multiplier);
+      const remoteRate = remoteDeckMediaStates[deckKey]?.playRate ?? 1;
+      if (Math.abs(remoteRate - multiplier) > 0.01) {
+        requestDeckRate(deckKey, multiplier);
+      }
     });
-  }, [audioSensitivity, decks, localSensitivityValues, setPlaybackRate]);
+  }, [
+    audioSensitivity,
+    decks,
+    localSensitivityValues,
+    remoteDeckMediaStates,
+    requestDeckRate,
+  ]);
 
   const mixComputation = useMemo(() => computeDeckMix(mixState), [mixState]);
   const { outputs: deckMixOutputs } = mixComputation;
@@ -472,11 +548,10 @@ const ControlPage = () => {
       setAudioSensitivity(clampedValue);
       send({ type: 'set-audio-sensitivity', payload: { value: clampedValue } });
       deckKeys.forEach((deckKey) => {
-        setPlaybackRate(`deck-${deckKey}`, clampedValue);
-        setPlaybackRate(`master-${deckKey}`, clampedValue);
+        requestDeckRate(deckKey, clampedValue);
       });
     },
-    [send, setPlaybackRate],
+    [requestDeckRate, send],
   );
 
   const sendDeckUpdate = useCallback(
@@ -581,26 +656,11 @@ const ControlPage = () => {
       if (!deck || deck.type !== 'video' || !deck.assetId) {
         return;
       }
-
-      const deckId = `deck-${deckKey}`;
-      const masterId = `master-${deckKey}`;
-      const isPlaying = deckStates[deckKey]?.isPlaying ?? false;
-      const willPlay = !isPlaying;
-
-      setDesiredDeckPlayback((previous) => ({
-        ...previous,
-        [deckKey]: willPlay,
-      }));
-
-      if (willPlay) {
-        void playVideo(deckId);
-        void playVideo(masterId);
-      } else {
-        pauseVideo(deckId);
-        pauseVideo(masterId);
-      }
+      const remoteState = remoteDeckMediaStates[deckKey];
+      const currentPlaying = remoteState?.isPlaying ?? deckStates[deckKey]?.isPlaying ?? false;
+      requestDeckToggle(deckKey, !currentPlaying);
     },
-    [deckStates, decks, pauseVideo, playVideo],
+    [deckStates, decks, remoteDeckMediaStates, requestDeckToggle],
   );
 
   const handleDeckPlaybackScrub = useCallback(
@@ -617,6 +677,17 @@ const ControlPage = () => {
       seekToPercent(deckId, clamped);
       seekToPercent(masterId, clamped);
 
+      const knownDuration =
+        deckDurationsRef.current[deckKey] ||
+        remoteDeckMediaStates[deckKey]?.duration ||
+        null;
+      if (knownDuration && Number.isFinite(knownDuration) && knownDuration > 0) {
+        const seconds = (clamped / 100) * knownDuration;
+        requestDeckSeek(deckKey, seconds, {
+          resume: remoteDeckMediaStates[deckKey]?.isPlaying ?? false,
+        });
+      }
+
       setDeckStates((previous) => {
         const prevState = previous[deckKey] ?? createDefaultDeckMediaState()[deckKey];
         if (Math.abs(prevState.progress - clamped) < 0.01) {
@@ -631,7 +702,7 @@ const ControlPage = () => {
         };
       });
     },
-    [decks, seekToPercent],
+    [decks, remoteDeckMediaStates, requestDeckSeek, seekToPercent],
   );
 
   const handleLocalSensitivityChange = useCallback(
@@ -642,10 +713,9 @@ const ControlPage = () => {
         [deckKey]: clampedSlider,
       }));
       const nextMultiplier = clampSensitivityValue(mapSliderToSensitivity(clampedSlider));
-      setPlaybackRate(`deck-${deckKey}`, nextMultiplier);
-      setPlaybackRate(`master-${deckKey}`, nextMultiplier);
+      requestDeckRate(deckKey, nextMultiplier);
     },
-    [setPlaybackRate],
+    [requestDeckRate],
   );
 
   const handleAssetLoad = useCallback(

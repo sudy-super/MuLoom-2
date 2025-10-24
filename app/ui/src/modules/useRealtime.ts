@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   ControlSettings,
-  DeckMediaStatus,
-  DeckMediaStatusMap,
+  DeckMediaStateIntent,
+  DeckTimelineState,
+  DeckTimelineStateMap,
   FallbackAssets,
   FallbackLayer,
   InboundMessage,
@@ -13,7 +14,7 @@ import type {
   StartVisualizationPayload,
   ViewerStatus,
 } from '../types/realtime';
-import { createDefaultDeckMediaStatus } from '../types/realtime';
+import { createDefaultDeckTimelineState } from '../types/realtime';
 import { MIX_DECK_KEYS, type DeckKey } from '../utils/mix';
 
 const EMPTY_DECK: MixDeck = { type: null, assetId: null, opacity: 0, enabled: false };
@@ -93,40 +94,64 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
       overlays: [],
     }),
   );
-  const createDefaultDeckMediaStates = useCallback((): DeckMediaStatusMap => {
-    const map = {} as DeckMediaStatusMap;
+  const createDefaultDeckMediaStates = useCallback((): DeckTimelineStateMap => {
+    const map = {} as DeckTimelineStateMap;
     MIX_DECK_KEYS.forEach((key) => {
-      map[key] =(createDefaultDeckMediaStatus());
+      map[key] = createDefaultDeckTimelineState();
     });
     return map;
   }, []);
 
-  const normaliseDeckMediaStates = useCallback(
-    (incoming?: Partial<Record<DeckKey, DeckMediaStatus>> | null): DeckMediaStatusMap => {
-      const base = createDefaultDeckMediaStates();
-      if (!incoming) {
-        return base;
+  const resolveDeckTimelineState = useCallback((source?: Partial<DeckTimelineState> | null): DeckTimelineState => {
+    const defaults = createDefaultDeckTimelineState();
+    if (!source) {
+      return { ...defaults };
+    }
+
+    const nowSeconds = Date.now() / 1000;
+    const normaliseNumber = (value: unknown, fallback: number, clampNonNegative = true) => {
+      const numeric = typeof value === 'number' ? value : Number(value);
+      if (!Number.isFinite(numeric)) {
+        return clampNonNegative ? Math.max(0, fallback) : fallback;
       }
-      const next = { ...base };
-      MIX_DECK_KEYS.forEach((key) => {
-        const source = incoming[key];
-        if (source) {
-          next[key] = {
-            isPlaying: Boolean(source.isPlaying),
-            progress: Math.max(0, Math.min(100, Number(source.progress ?? 0))),
-            isLoading: Boolean(source.isLoading),
-            error: Boolean(source.error),
-            src:
-              typeof source.src === 'string' && source.src.trim().length > 0
-                ? source.src
-                : null,
-          };
-        }
-      });
-      return next;
-    },
-    [createDefaultDeckMediaStates],
-  );
+      return clampNonNegative ? Math.max(0, numeric) : numeric;
+    };
+
+    const src =
+      typeof source.src === 'string' && source.src.trim().length > 0 ? source.src.trim() : null;
+    const playRate = Math.min(8, Math.max(0, normaliseNumber(source.playRate, defaults.playRate)));
+    const basePosition = normaliseNumber(source.basePosition, defaults.basePosition);
+    const updatedAt = normaliseNumber(source.updatedAt, nowSeconds, false);
+    const isPlaying = Boolean(source.isPlaying);
+    const durationRaw = typeof source.duration === 'number' ? source.duration : Number(source.duration);
+    const duration =
+      Number.isFinite(durationRaw) && durationRaw > 0 ? durationRaw : null;
+    const isLoading = Boolean(source.isLoading);
+    const error = Boolean(source.error);
+    const version =
+      typeof source.version === 'number' && Number.isFinite(source.version) && source.version >= 0
+        ? Number(source.version)
+        : defaults.version;
+    const explicitPositionRaw =
+      typeof source.position === 'number' ? source.position : Number(source.position);
+    const explicitPosition =
+      Number.isFinite(explicitPositionRaw) && explicitPositionRaw >= 0 ? explicitPositionRaw : null;
+    const elapsed = isPlaying ? Math.max(0, nowSeconds - updatedAt) : 0;
+    const computedPosition = basePosition + elapsed * playRate;
+
+    return {
+      src,
+      isPlaying,
+      basePosition,
+      position: explicitPosition ?? Math.max(0, computedPosition),
+      playRate,
+      updatedAt,
+      version,
+      isLoading,
+      error,
+      duration,
+    };
+  }, []);
 
   const normaliseMixState = useCallback((incoming?: Partial<MixState> | null): MixState => {
     const source = incoming ?? {};
@@ -146,7 +171,7 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
   }, []);
 
   const [mixState, setMixState] = useState<MixState>(() => normaliseMixState());
-  const [deckMediaStates, setDeckMediaStates] = useState<DeckMediaStatusMap>(
+  const [deckMediaStates, setDeckMediaStates] = useState<DeckTimelineStateMap>(
     () => createDefaultDeckMediaStates(),
   );
 
@@ -163,6 +188,65 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
       }
     },
     [],
+  );
+
+  const requestDeckState = useCallback(
+    (deck: DeckKey, state: DeckMediaStateIntent) => {
+      send({
+        type: 'deck-media-state',
+        payload: {
+          deck,
+          state,
+        },
+      });
+    },
+    [send],
+  );
+
+  const requestDeckToggle = useCallback(
+    (deck: DeckKey, override?: boolean) => {
+      requestDeckState(deck, { intent: 'toggle', isPlaying: override });
+    },
+    [requestDeckState],
+  );
+
+  const requestDeckPlay = useCallback(
+    (deck: DeckKey) => {
+      requestDeckState(deck, { intent: 'play' });
+    },
+    [requestDeckState],
+  );
+
+  const requestDeckPause = useCallback(
+    (deck: DeckKey) => {
+      requestDeckState(deck, { intent: 'pause' });
+    },
+    [requestDeckState],
+  );
+
+  const requestDeckSeek = useCallback(
+    (deck: DeckKey, positionSeconds: number, options?: { resume?: boolean }) => {
+      requestDeckState(deck, {
+        intent: 'seek',
+        position: Math.max(0, positionSeconds),
+        resume: options?.resume,
+      });
+    },
+    [requestDeckState],
+  );
+
+  const requestDeckRate = useCallback(
+    (deck: DeckKey, rate: number) => {
+      requestDeckState(deck, { intent: 'rate', value: Math.max(0, rate) });
+    },
+    [requestDeckState],
+  );
+
+  const requestDeckSource = useCallback(
+    (deck: DeckKey, src: string | null) => {
+      requestDeckState(deck, { intent: 'source', src });
+    },
+    [requestDeckState],
   );
 
   useEffect(() => {
@@ -207,9 +291,16 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
             if (message.payload.state.mixState) {
               setMixState(normaliseMixState(message.payload.state.mixState));
             }
-            setDeckMediaStates(
-              normaliseDeckMediaStates(message.payload.state.deckMediaStates ?? null),
-            );
+            setDeckMediaStates(() => {
+              const next = createDefaultDeckMediaStates();
+              const incomingStates = message.payload.state.deckMediaStates as
+                | Partial<Record<DeckKey, Partial<DeckTimelineState>>>
+                | undefined;
+              MIX_DECK_KEYS.forEach((key) => {
+                next[key] = resolveDeckTimelineState(incomingStates?.[key]);
+              });
+              return next;
+            });
             break;
           }
           case 'fallback-layers': {
@@ -225,15 +316,35 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
             break;
           }
           case 'deck-media-state': {
-            setDeckMediaStates((previous) => ({
-              ...previous,
-              [message.payload.deck]: {
-                ...previous[message.payload.deck],
-                ...normaliseDeckMediaStates({ [message.payload.deck]: message.payload.state })[
-                  message.payload.deck
-                ],
-              },
-            }));
+            const deckKey = message.payload.deck;
+            const incoming = resolveDeckTimelineState(message.payload.state);
+            setDeckMediaStates((previous) => {
+              const previousState = previous[deckKey] ?? createDefaultDeckTimelineState();
+              if (previousState.version > incoming.version) {
+                return previous;
+              }
+              if (previousState.version === incoming.version) {
+                const keysToCompare: Array<keyof DeckTimelineState> = [
+                  'src',
+                  'isPlaying',
+                  'basePosition',
+                  'playRate',
+                  'isLoading',
+                  'error',
+                  'duration',
+                ];
+                const unchanged = keysToCompare.every(
+                  (key) => previousState[key] === incoming[key],
+                );
+                if (unchanged) {
+                  return previous;
+                }
+              }
+              return {
+                ...previous,
+                [deckKey]: incoming,
+              };
+            });
             break;
           }
           case 'update-mix-deck': {
@@ -318,7 +429,7 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
       wsRef.current = null;
       setConnectionState('closed');
     };
-  }, [role, normaliseMixState]);
+  }, [role, normaliseMixState, createDefaultDeckMediaStates, resolveDeckTimelineState]);
 
   return {
     connectionState,
@@ -329,5 +440,12 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
     mixState,
     deckMediaStates,
     send,
+    requestDeckState,
+    requestDeckToggle,
+    requestDeckPlay,
+    requestDeckPause,
+    requestDeckSeek,
+    requestDeckRate,
+    requestDeckSource,
   };
 }

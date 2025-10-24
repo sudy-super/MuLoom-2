@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict
+import time
 
 from ..graph.mixers import MixerLayer
 from ..pipeline import Pipeline
@@ -135,42 +136,196 @@ class ViewerStatus:
 
 @dataclass
 class DeckMediaState:
+    """
+    Represents the authoritative transport state for a single deck timeline.
+    """
+
+    src: str | None = None
     is_playing: bool = False
-    progress: float = 0.0
+    base_position: float = 0.0
+    play_rate: float = 1.0
+    updated_at: float = field(default_factory=lambda: time.time())
+    version: int = 0
     is_loading: bool = False
     error: bool = False
-    src: str | None = None
+    duration: float | None = None
+    _updated_at_monotonic: float = field(default_factory=time.monotonic, repr=False)
+
+    def _normalise_src(self, value) -> str | None:
+        if isinstance(value, str):
+            candidate = value.strip()
+            return candidate or None
+        if value is None:
+            return None
+        return self.src
+
+    def _current_position(self, monotonic_now: float | None = None) -> float:
+        current_monotonic = time.monotonic() if monotonic_now is None else monotonic_now
+        elapsed = max(0.0, current_monotonic - self._updated_at_monotonic)
+        if not self.is_playing:
+            return max(0.0, float(self.base_position))
+        return max(0.0, float(self.base_position) + elapsed * float(self.play_rate))
+
+    def _bump_version(self, monotonic_now: float | None = None) -> None:
+        self.version += 1
+        self.updated_at = time.time()
+        self._updated_at_monotonic = time.monotonic() if monotonic_now is None else monotonic_now
+
+    def _apply_direct_fields(self, payload: dict, monotonic_now: float | None = None) -> bool:
+        changed = False
+        if "isLoading" in payload:
+            next_value = bool(payload.get("isLoading"))
+            if self.is_loading != next_value:
+                self.is_loading = next_value
+                changed = True
+        if "error" in payload:
+            next_value = bool(payload.get("error"))
+            if self.error != next_value:
+                self.error = next_value
+                changed = True
+        if "src" in payload:
+            next_src = self._normalise_src(payload.get("src"))
+            if next_src != self.src:
+                self.src = next_src
+                changed = True
+        if "duration" in payload:
+            duration_value = payload.get("duration")
+            try:
+                next_duration = float(duration_value if duration_value is not None else 0.0)
+                if next_duration <= 0:
+                    next_duration = None
+            except (TypeError, ValueError):
+                next_duration = None
+            if self.duration != next_duration:
+                self.duration = next_duration
+                changed = True
+
+        return changed
+
+    def apply_request(self, payload: dict | None) -> bool:
+        if not payload:
+            return False
+
+        monotonic_now = time.monotonic()
+        intent = str(payload.get("intent") or "").lower()
+        changed = False
+
+        def resolve_position() -> float:
+            return self._current_position(monotonic_now)
+
+        if intent in {"toggle", "play", "pause"}:
+            target: bool
+            if intent == "toggle":
+                if "isPlaying" in payload:
+                    target = bool(payload.get("isPlaying"))
+                else:
+                    target = not self.is_playing
+            else:
+                target = intent == "play"
+
+            if self.is_playing != target:
+                self.base_position = resolve_position()
+                self.is_playing = target
+                changed = True
+
+        elif intent in {"seek", "scrub"}:
+            raw_value = payload.get("position", payload.get("value"))
+            if raw_value is not None:
+                try:
+                    target_position = max(0.0, float(raw_value))
+                except (TypeError, ValueError):
+                    target_position = self.base_position
+                if abs(self.base_position - target_position) > 1e-3:
+                    self.base_position = target_position
+                    changed = True
+            if "resume" in payload:
+                resume_playback = bool(payload.get("resume"))
+                if self.is_playing != resume_playback:
+                    if resume_playback:
+                        self.base_position = resolve_position()
+                    self.is_playing = resume_playback
+                    changed = True
+            elif changed:
+                # default behaviour: pause after seek unless explicitly requested
+                if self.is_playing:
+                    self.is_playing = False
+                    changed = True
+
+        elif intent in {"rate", "speed"}:
+            raw_rate = payload.get("value")
+            if raw_rate is not None:
+                try:
+                    next_rate = max(0.0, float(raw_rate))
+                except (TypeError, ValueError):
+                    next_rate = self.play_rate
+                if abs(next_rate - self.play_rate) > 1e-6:
+                    current_position = resolve_position()
+                    self.base_position = current_position
+                    self.play_rate = next_rate
+                    changed = True
+
+        elif intent in {"source", "src"}:
+            target_src = self._normalise_src(payload.get("src") or payload.get("value"))
+            if target_src != self.src:
+                self.src = target_src
+                changed = True
+
+        elif intent == "state":
+            nested_payload = payload.get("value")
+            if isinstance(nested_payload, dict):
+                changed = self.apply_request(nested_payload) or changed
+
+        else:
+            # Backwards compatibility: allow direct field updates without intent.
+            direct_updates = {k: payload.get(k) for k in ("isPlaying", "basePosition", "playRate")}
+            if direct_updates.get("isPlaying") is not None:
+                target_playing = bool(direct_updates["isPlaying"])
+                if self.is_playing != target_playing:
+                    self.base_position = resolve_position()
+                    self.is_playing = target_playing
+                    changed = True
+            if direct_updates.get("basePosition") is not None:
+                try:
+                    target_position = max(0.0, float(direct_updates["basePosition"]))
+                except (TypeError, ValueError):
+                    target_position = self.base_position
+                if abs(self.base_position - target_position) > 1e-3:
+                    self.base_position = target_position
+                    changed = True
+            if direct_updates.get("playRate") is not None:
+                try:
+                    target_rate = max(0.0, float(direct_updates["playRate"]))
+                except (TypeError, ValueError):
+                    target_rate = self.play_rate
+                if abs(self.play_rate - target_rate) > 1e-6:
+                    current_position = resolve_position()
+                    self.base_position = current_position
+                    self.play_rate = target_rate
+                    changed = True
+
+        direct_changed = self._apply_direct_fields(payload, monotonic_now=monotonic_now)
+        changed = changed or direct_changed
+
+        if changed:
+            self._bump_version(monotonic_now=monotonic_now)
+
+        return changed
 
     def to_dict(self) -> dict:
+        monotonic_now = time.monotonic()
+        current_position = self._current_position(monotonic_now)
         return {
+            "src": self.src,
             "isPlaying": bool(self.is_playing),
-            "progress": max(0.0, min(100.0, float(self.progress))),
+            "basePosition": max(0.0, float(self.base_position)),
+            "position": max(0.0, float(current_position)),
+            "playRate": max(0.0, float(self.play_rate)),
+            "updatedAt": float(self.updated_at),
+            "version": int(self.version),
             "isLoading": bool(self.is_loading),
             "error": bool(self.error),
-            "src": self.src,
+            "duration": self.duration,
         }
-
-    def update(self, payload: dict) -> None:
-        if "isPlaying" in payload:
-            self.is_playing = bool(payload.get("isPlaying"))
-        if "progress" in payload:
-            value = payload.get("progress")
-            try:
-                numeric = float(value if value is not None else 0.0)
-            except (TypeError, ValueError):
-                numeric = 0.0
-            self.progress = max(0.0, min(100.0, numeric))
-        if "isLoading" in payload:
-            self.is_loading = bool(payload.get("isLoading"))
-        if "error" in payload:
-            self.error = bool(payload.get("error"))
-        if "src" in payload:
-            src = payload.get("src")
-            if isinstance(src, str):
-                src = src.strip() or None
-            else:
-                src = None
-            self.src = src
 
 
 @dataclass
@@ -244,8 +399,7 @@ class EngineState:
         state = self.deck_media_states.get(deck_key)
         if not state:
             return False
-        state.update(payload or {})
-        return True
+        return state.apply_request(payload or {})
 
     def mixer_layers(self) -> Dict[str, MixerLayer]:
         layers = {}
