@@ -5,7 +5,8 @@ Shared engine state container.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict
+import logging
+from typing import Dict, List
 import time
 
 from ..graph.mixers import MixerLayer
@@ -13,6 +14,8 @@ from ..pipeline import Pipeline
 
 ALLOWED_DECK_TYPES = {"shader", "video", "generative"}
 DECK_KEYS = ("a", "b", "c", "d")
+
+LOG = logging.getLogger(__name__)
 
 
 def clamp01(value: float) -> float:
@@ -358,14 +361,13 @@ class EngineState:
         }
 
     def rebuild_mixer_layers(self) -> None:
-        self.pipeline.mixer.clear()
+        layers: List[MixerLayer] = []
         for key, deck in self.mix.decks.items():
-            if not deck.enabled or not (deck.asset_id or deck.type):
+            if not deck.enabled or deck.type != "video" or not deck.asset_id:
                 continue
-            source_id = deck.asset_id or f"deck-{key}"
-            self.pipeline.mixer.add_layer(
-                MixerLayer(source_id=source_id, opacity=clamp01(deck.opacity))
-            )
+            source_id = self.pipeline.source_id_for_deck(key)
+            layers.append(MixerLayer(source_id=source_id, opacity=clamp01(deck.opacity)))
+        self.pipeline.set_mixer_layers(layers)
 
     def apply_deck_update(self, deck_key: str, payload: dict) -> bool:
         deck = self.mix.decks.get(deck_key)
@@ -399,10 +401,19 @@ class EngineState:
         state = self.deck_media_states.get(deck_key)
         if not state:
             return False
-        return state.apply_request(payload or {})
+        previous_src = state.src
+        changed = state.apply_request(payload or {})
+        if changed and previous_src != state.src:
+            try:
+                self.pipeline.set_deck_source(deck_key, state.src)
+            except Exception:  # pragma: no cover - defensive
+                LOG.exception("Failed to update pipeline source for deck '%s'", deck_key)
+        return changed
 
     def mixer_layers(self) -> Dict[str, MixerLayer]:
         layers = {}
         for key, deck in self.mix.decks.items():
-            layers[key] = MixerLayer(source_id=deck.asset_id or key, opacity=deck.opacity)
+            layers[key] = MixerLayer(
+                source_id=self.pipeline.source_id_for_deck(key), opacity=deck.opacity
+            )
         return layers

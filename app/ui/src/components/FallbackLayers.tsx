@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import GlslCanvas from 'glslCanvas';
 import type { AudioAnalysis } from '../modules/AudioInput';
 import type { CSSProperties } from 'react';
@@ -20,10 +20,25 @@ interface VideoLayerProps {
   opacity: number;
   blendMode?: BlendMode;
   mediaState?: DeckTimelineState;
+  registerVideo?: (element: HTMLVideoElement | null) => void;
 }
 
-export function VideoFallbackLayer({ id, src, opacity, blendMode, mediaState }: VideoLayerProps) {
+export function VideoFallbackLayer({
+  id,
+  src,
+  opacity,
+  blendMode,
+  mediaState,
+  registerVideo,
+}: VideoLayerProps) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const handleVideoRef = useCallback(
+    (element: HTMLVideoElement | null) => {
+      videoRef.current = element;
+      registerVideo?.(element);
+    },
+    [registerVideo],
+  );
   const mixBlend =
     blendMode && (blendModeMap[blendMode] ?? (blendMode as CSSProperties['mixBlendMode']));
   const resolvedSrc = mediaState?.src ?? src;
@@ -155,7 +170,7 @@ export function VideoFallbackLayer({ id, src, opacity, blendMode, mediaState }: 
 
   return (
     <video
-      ref={videoRef}
+      ref={handleVideoRef}
       className="fallback-layer"
       id={id}
       src={resolvedSrc}

@@ -8,7 +8,6 @@
 - ISF shader 対応
 - HAP / H.264 対応
 - Beat Sync（テンポ/オンセット駆動）
-- パニックカード（安全な即時フェールセーフ映像）
 - 出力用のリアルタイム再生エンジンと UI エンジンを**別プロセス**に分離
 - プリレンダ・ジェネ統合（オフライン書き出し／ジェネレータ）
 
@@ -76,8 +75,7 @@ muloom-a/
 │  │   ├─ isf_loader.py         # ISF 読込→GLSL/パス連結
 │  │   ├─ sources.py            # ファイル/カメラ/NDI/HAP 等入力
 │  │   ├─ outputs.py            # 画面/NDI/webrtc/filesink 等出力
-│  │   ├─ codecs.py             # HAP/H.264/PCM 等のケイパビ
-│  │   └─ panic.py              # パニックカード（input-selector/valve）
+│  │   └─ codecs.py             # HAP/H.264/PCM 等のケイパビ
 │  ├─ rtc/
 │  │   ├─ webrtc.py             # webrtcbin の生成/SDP/ICE ハンドラ
 │  │   └─ preview_branch.py     # gldownload→vtenc_h264→webrtcbin
@@ -155,17 +153,13 @@ muloom-a/
 - `taps.py`：音声の `tee` / `appsink` を用意。
 - `beat_aubio.py`/`beat_essentia.py`：BPM/オンセット検出 → WebSocket で UI/サーバへ通知。
 
-### engine/graph/panic.py
-- **パニックカード**を `input-selector` + `valve` で実現。任意の段で**黒/タイトル/ロゴ静止**へ即時切替。
-- 重大エラー時には **自動フェールセーフ**に切替（watchdog）。
-
 ### engine/pregen/*
 - `prerender.py`：任意のシーン構成 + パラメータ列を**ジョブ**として受理。
 - GStreamer パイプラインを**ヘッドレス**に生成し、`vtenc_h264` または `avenc_hap` で**書き出し**。
 - バッチ/キューはシンプルな SQLite/JSON キューでも可。
 
 ### engine/api/*
-- `server.py`：REST/WS（FastAPI）。アセット列挙、デッキ操作、フェーダ、ISF パラメータ、NDI 入出力選択、パニック切替、プリレンダ指示など。
+- `server.py`：REST/WS（FastAPI）。アセット列挙、デッキ操作、フェーダ、ISF パラメータ、NDI 入出力選択、プリレンダ指示など。
 - `schemas.py`：pydantic モデル。
 - `state.py`：ミックス状態（例：レイヤ構成、クロスフェーダ、シーンプリセット）。
 
@@ -208,19 +202,6 @@ gst-launch-1.0 gltestsrc ! videoconvert !   vtenc_h264 realtime=true allow-frame
 - `audio/taps.py` で `appsink` に流し、`beat_aubio.py` が**リアルタイム BPM/オンセット**を推定。
 - 推定結果は **WS イベント**として UI へ送信（UI 側は拍変化でエフェクトやカットを駆動）。
 - Essentia 版はオフライン/高精度向け（任意）。
-
-### 4.5 パニックカード（フェールセーフ）
-- `input-selector` をミックス直前に配置し、**通常出力**と**パニック出力（黒/ロゴ/バー）**を切替。
-- 自動復帰を避ける場合は、オペレータの解除操作を必須に（誤復帰防止）。
-- 重大例外やソース喪失時には `valve drop=true` で枝を遮断 → セレクタを**パニック側**に切替。
-
-**参考**
-```bash
-# 通常系 tee と パニック（黒）を input-selector で切替
-videomixer_out ! input-selector name=sel ! glimagesink
-videotestsrc pattern=black is-live=true ! sel.
-# 切替: gst_util_set_object_arg(G_OBJECT(sel), "active-pad", pad_of_black);
-```
 
 ### 4.6 別プロセス分離（UI/Engine）
 - UI（Tauri WebView 内）と Engine は**ローカル WS/HTTP**で通信。
@@ -270,13 +251,6 @@ B. ! queue ! videoconvert ! glupload ! glshader fragment="<frag>" ! mix.
 ndisrc source-name="StageCam-1" ! ndisrcdemux name=dm
 dm. ! queue ! videoconvert ! glupload ! glshader fragment="<frag>" ! glvideomixer name=mix ! ndisink ndi-name="MuLoomOut"
 uridecodebin uri=file:///clip_hap.mov ! avdec_hap ! videoconvert ! glupload ! mix.
-```
-
-### 6.3 パニックカード（黒）切替
-```
-... ! queue ! input-selector name=sel ! glimagesink
-videotestsrc pattern=black is-live=true ! sel.
-# 通常経路は別枝から sel. へリンク、UI から active-pad を切替
 ```
 
 ---

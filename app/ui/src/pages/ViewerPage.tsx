@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+} from 'react';
 import { CodeEditor } from '../components/CodeEditor';
 import { ShaderFallbackLayer, VideoFallbackLayer } from '../components/FallbackLayers';
 import { AudioInput, type AudioAnalysis } from '../modules/AudioInput';
@@ -7,7 +14,8 @@ import { GLSLRenderer } from '../modules/GLSLRenderer';
 import { useViewerCapture } from '../modules/useViewerCapture';
 import { useRTCStreaming } from '../modules/useRTCStreaming';
 import { useRealtime } from '../modules/useRealtime';
-import type { RTCSignalMessage, StartVisualizationPayload } from '../types/realtime';
+import { useVideoMedia } from '../modules/useVideoMedia';
+import type { DeckMediaStateIntent, RTCSignalMessage, StartVisualizationPayload } from '../types/realtime';
 import { computeDeckMix, type DeckKey, MIX_DECK_KEYS } from '../utils/mix';
 import '../App.css';
 
@@ -40,6 +48,7 @@ const ViewerPage = () => {
   const [error, setError] = useState('');
   const [generatedCode, setGeneratedCode] = useState('');
   const [audioSensitivity, setAudioSensitivityState] = useState(1.0);
+  const [requiresUserTap, setRequiresUserTap] = useState(false);
 
   const startVisualizationRef = useRef<(payload: StartVisualizationPayload) => void>(() => {});
   const stopVisualizationRef = useRef<() => void>(() => {});
@@ -55,7 +64,7 @@ const ViewerPage = () => {
   });
   const startStreamingRef = useRef<() => Promise<void>>(async () => {});
 
-  const { assets, mixState, deckMediaStates, send } = useRealtime('viewer', {
+  const { assets, mixState, deckMediaStates, send, requestDeckState } = useRealtime('viewer', {
     onStartVisualization: (payload) => startVisualizationRef.current(payload),
     onStopVisualization: () => stopVisualizationRef.current(),
     onRegenerateShader: () => regenerateShaderRef.current(),
@@ -81,6 +90,17 @@ const ViewerPage = () => {
     },
   });
 
+  const {
+    registerVideo: registerManagedVideo,
+    loadSource: loadManagedSource,
+    play: playManagedVideo,
+    pause: pauseManagedVideo,
+    seekToPercent: seekManagedToPercent,
+    setPlaybackRate: setManagedPlaybackRate,
+    addEventListener: addManagedEventListener,
+    getState: getManagedState,
+  } = useVideoMedia();
+
   const { startCapture, stopCapture } = useViewerCapture({ frameRate: 30, quality: 0.85 });
 
   const sendRTCSignal = useCallback(
@@ -101,10 +121,257 @@ const ViewerPage = () => {
   const isStartingStreamRef = useRef(false);
   const hasConnectedStreamRef = useRef(false);
 
+  const deckDurationsRef = useRef<Record<DeckKey, number>>({
+    a: 0,
+    b: 0,
+    c: 0,
+    d: 0,
+  });
+
+  const lastDeckBroadcastRef = useRef<Record<DeckKey, number>>({
+    a: 0,
+    b: 0,
+    c: 0,
+    d: 0,
+  });
+
+  const lastDeckSnapshotRef = useRef<Record<DeckKey, {
+    state: string;
+    position: number;
+    src: string | null;
+    playRate: number;
+  }>>({
+    a: { state: 'idle', position: 0, src: null, playRate: 1 },
+    b: { state: 'idle', position: 0, src: null, playRate: 1 },
+    c: { state: 'idle', position: 0, src: null, playRate: 1 },
+    d: { state: 'idle', position: 0, src: null, playRate: 1 },
+  });
+
+  const viewerVideoRefCallbacks = useMemo(
+    () =>
+      MIX_DECK_KEYS.reduce((accumulator, key) => {
+        accumulator[key] = (element: HTMLVideoElement | null) => {
+          registerManagedVideo(`viewer-${key}`, element);
+        };
+        return accumulator;
+      }, {} as Record<DeckKey, (element: HTMLVideoElement | null) => void>),
+    [registerManagedVideo],
+  );
+
+  const resolveDeckAssetSrc = useCallback(
+    (deckKey: DeckKey): string | null => {
+      const deck = mixState?.decks?.[deckKey];
+      if (!deck || deck.type !== 'video' || !deck.assetId) {
+        return null;
+      }
+      const asset =
+        assets.videos.find((item) => item.id === deck.assetId) ??
+        assets.overlays?.find((item) => item.id === deck.assetId);
+      if (asset && 'url' in asset && typeof asset.url === 'string') {
+        return asset.url;
+      }
+      return null;
+    },
+    [assets.overlays, assets.videos, mixState?.decks],
+  );
+
+  const handleUserTap = useCallback(() => {
+    setRequiresUserTap(false);
+    MIX_DECK_KEYS.forEach((deckKey) => {
+      playManagedVideo(`viewer-${deckKey}`);
+    });
+  }, [playManagedVideo]);
+
+  const handleUserTapKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        handleUserTap();
+      }
+    },
+    [handleUserTap],
+  );
+
   rtcSignalHandlersRef.current = {
     handleRemoteAnswer,
     addRemoteIceCandidate,
   };
+
+  useEffect(() => {
+    const unsubscribes = MIX_DECK_KEYS.map((deckKey) => {
+      const managerKey = `viewer-${deckKey}`;
+      return addManagedEventListener(managerKey, (mediaState, details) => {
+        const managerSnapshot = getManagedState(managerKey);
+        const durationDetail =
+          typeof details?.duration === 'number' && Number.isFinite(details.duration)
+            ? details.duration
+            : undefined;
+        if (durationDetail && durationDetail > 0) {
+          deckDurationsRef.current[deckKey] = durationDetail;
+        }
+
+        const durationSeconds =
+          durationDetail ?? deckDurationsRef.current[deckKey] ?? null;
+        const progressPercent =
+          typeof details?.progress === 'number' && Number.isFinite(details.progress)
+            ? Math.max(0, Math.min(100, details.progress))
+            : typeof managerSnapshot.progress === 'number'
+              ? Math.max(0, Math.min(100, managerSnapshot.progress))
+              : 0;
+        const currentTimeSeconds =
+          typeof details?.currentTime === 'number' && Number.isFinite(details.currentTime)
+            ? Math.max(0, details.currentTime)
+            : durationSeconds && durationSeconds > 0
+              ? (progressPercent / 100) * durationSeconds
+              : 0;
+
+        const now = performance.now();
+        const lastSnapshot = lastDeckSnapshotRef.current[deckKey];
+        const didStateChange = lastSnapshot.state !== mediaState;
+        const elapsedSinceBroadcast = now - lastDeckBroadcastRef.current[deckKey];
+        const throttleInterval = 250;
+
+        const effectiveSrc = managerSnapshot.src ?? resolveDeckAssetSrc(deckKey);
+        const effectiveRate = Number.isFinite(managerSnapshot.playbackRate)
+          ? managerSnapshot.playbackRate
+          : 1;
+
+        if (mediaState === 'playing') {
+          setRequiresUserTap(false);
+        } else if (mediaState === 'paused' || mediaState === 'error') {
+          const rawError =
+            (details && (details as Record<string, unknown>).error) ??
+            (details && (details as Record<string, unknown>).videoError) ??
+            null;
+          const errorName =
+            rawError && typeof rawError === 'object' && 'name' in rawError
+              ? String((rawError as { name?: unknown }).name ?? '')
+              : '';
+          const isAutoplayBlock =
+            typeof errorName === 'string' && errorName.toLowerCase().includes('notallowed');
+          if (isAutoplayBlock || mediaState === 'error') {
+            setRequiresUserTap(true);
+          }
+        }
+
+        const shouldBroadcast =
+          didStateChange ||
+          elapsedSinceBroadcast >= throttleInterval ||
+          Math.abs(lastSnapshot.position - currentTimeSeconds) > 0.25 ||
+          lastSnapshot.src !== effectiveSrc ||
+          Math.abs(lastSnapshot.playRate - effectiveRate) > 0.01;
+
+        if (!shouldBroadcast) {
+          return;
+        }
+
+        const payload: DeckMediaStateIntent = {
+          intent: 'state',
+          value: {
+            isPlaying: mediaState === 'playing',
+            basePosition: currentTimeSeconds,
+            position: currentTimeSeconds,
+            playRate: effectiveRate,
+            src: effectiveSrc ?? null,
+            isLoading: mediaState === 'loading',
+            error: mediaState === 'error',
+          },
+        };
+
+        if (durationSeconds && Number.isFinite(durationSeconds) && durationSeconds > 0) {
+          payload.value.duration = durationSeconds;
+        }
+
+        requestDeckState(deckKey, payload);
+        lastDeckBroadcastRef.current[deckKey] = now;
+        lastDeckSnapshotRef.current[deckKey] = {
+          state: mediaState,
+          position: currentTimeSeconds,
+          src: effectiveSrc ?? null,
+          playRate: effectiveRate,
+        };
+      });
+    });
+    return () => {
+      unsubscribes.forEach((unsubscribe) => unsubscribe());
+    };
+  }, [
+    addManagedEventListener,
+    getManagedState,
+    requestDeckState,
+    resolveDeckAssetSrc,
+  ]);
+
+  useEffect(() => {
+    const nowSeconds = Date.now() / 1000;
+    MIX_DECK_KEYS.forEach((deckKey) => {
+      const managerKey = `viewer-${deckKey}`;
+      const state = deckMediaStates?.[deckKey];
+      const managerState = getManagedState(managerKey);
+      const targetSrc = state?.src ?? resolveDeckAssetSrc(deckKey);
+
+      if (targetSrc) {
+        if (managerState.src !== targetSrc) {
+          void loadManagedSource(managerKey, targetSrc);
+        }
+      } else if (managerState.src) {
+        void loadManagedSource(managerKey, null);
+      }
+
+      if (!state) {
+        pauseManagedVideo(managerKey);
+        return;
+      }
+
+      if (state.duration && Number.isFinite(state.duration) && state.duration > 0) {
+        deckDurationsRef.current[deckKey] = state.duration;
+      }
+
+      const desiredRate = Number.isFinite(state.playRate) ? state.playRate : 1;
+      if (Math.abs((managerState.playbackRate ?? 1) - desiredRate) > 0.01) {
+        setManagedPlaybackRate(managerKey, desiredRate);
+      }
+
+      const duration =
+        deckDurationsRef.current[deckKey] ||
+        (state.duration && Number.isFinite(state.duration) ? state.duration : null);
+      if (duration && Number.isFinite(duration) && duration > 0) {
+        const elapsed = state.isPlaying ? Math.max(0, nowSeconds - state.updatedAt) : 0;
+        const basePosition = Number.isFinite(state.basePosition) ? state.basePosition : 0;
+        const playRate = Number.isFinite(state.playRate) ? state.playRate : 1;
+        const hasExplicitPosition =
+          typeof state.position === 'number' && Number.isFinite(state.position);
+        const position = hasExplicitPosition
+          ? Math.max(0, state.position)
+          : basePosition + elapsed * playRate;
+        const targetPercent = Math.max(0, Math.min(100, (position / duration) * 100));
+        if (
+          typeof managerState.progress === 'number' &&
+          Math.abs(managerState.progress - targetPercent) > 1.5
+        ) {
+          seekManagedToPercent(managerKey, targetPercent);
+        }
+      }
+
+      const shouldPlay = state.isPlaying && Boolean(targetSrc);
+      if (shouldPlay) {
+        playManagedVideo(managerKey);
+      } else if (managerState.state === 'playing' || managerState.pendingPlay) {
+        pauseManagedVideo(managerKey);
+      }
+    });
+  }, [
+    assets.overlays,
+    assets.videos,
+    deckMediaStates,
+    getManagedState,
+    loadManagedSource,
+    pauseManagedVideo,
+    playManagedVideo,
+    resolveDeckAssetSrc,
+    seekManagedToPercent,
+    setManagedPlaybackRate,
+  ]);
 
   const startStreaming = useCallback(async () => {
     if (isStartingStreamRef.current) {
@@ -488,6 +755,7 @@ const ViewerPage = () => {
           opacity={effectiveOpacity}
           blendMode={blendMode}
           mediaState={deckMediaStates?.[deckKey]}
+          registerVideo={viewerVideoRefCallbacks[deckKey]}
         />
       );
     }
@@ -518,6 +786,40 @@ const ViewerPage = () => {
       <div className="mix-layer-stack">
         {MIX_DECK_KEYS.map((key) => renderDeckLayer(key))}
       </div>
+      {requiresUserTap ? (
+        <div
+          className="viewer-autoplay-overlay"
+          role="button"
+          tabIndex={0}
+          onClick={handleUserTap}
+          onKeyDown={handleUserTapKeyDown}
+          style={{
+            position: 'fixed',
+            inset: 0,
+            backgroundColor: 'rgba(0, 0, 0, 0.65)',
+            color: '#ffffff',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            cursor: 'pointer',
+            zIndex: 1000,
+          }}
+        >
+          <div
+            style={{
+              maxWidth: '28rem',
+              textAlign: 'center',
+              padding: '1.5rem',
+              lineHeight: 1.5,
+            }}
+          >
+            <strong>Click to start playback</strong>
+            <p style={{ marginTop: '0.5rem' }}>
+              The browser blocked autoplay on the viewer. Click or press Enter to resume all decks.
+            </p>
+          </div>
+        </div>
+      ) : null}
 
     </div>
   );

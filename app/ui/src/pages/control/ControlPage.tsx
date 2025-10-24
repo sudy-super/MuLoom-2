@@ -160,6 +160,23 @@ const ControlPage = () => {
     d: null,
   });
 
+  const resolveDeckAssetSrc = useCallback(
+    (deckKey: DeckKey): string | null => {
+      const deck = decks[deckKey];
+      if (!deck || deck.type !== 'video' || !deck.assetId) {
+        return null;
+      }
+      const asset =
+        assets.videos.find((item) => item.id === deck.assetId) ??
+        assets.overlays?.find((item) => item.id === deck.assetId);
+      if (asset && 'url' in asset && typeof asset.url === 'string') {
+        return asset.url;
+      }
+      return null;
+    },
+    [assets.overlays, assets.videos, decks],
+  );
+
   const consumeRtcSignal = useCallback(() => {
     setRtcSignalQueue((previous) => {
       if (previous.length === 0) {
@@ -280,27 +297,12 @@ const ControlPage = () => {
 
   useEffect(() => {
     let cancelled = false;
-
-    const resolveAssetSrc = (deckKey: DeckKey): string | null => {
-      const deck = decks[deckKey];
-      if (!deck || deck.type !== 'video' || !deck.assetId) {
-        return null;
-      }
-      const asset =
-        assets.videos.find((item) => item.id === deck.assetId) ??
-        assets.overlays?.find((item) => item.id === deck.assetId);
-      if (asset && 'url' in asset && typeof asset.url === 'string') {
-        return asset.url;
-      }
-      return null;
-    };
-
     const loadDecks = async () => {
       for (const deckKey of deckKeys) {
         const deckId = `deck-${deckKey}`;
         const masterId = `master-${deckKey}`;
         const remoteState = remoteDeckMediaStates[deckKey];
-        const targetSrc = remoteState?.src ?? resolveAssetSrc(deckKey);
+        const targetSrc = remoteState?.src ?? resolveDeckAssetSrc(deckKey);
 
         try {
           const deckManagerState = getState(deckId);
@@ -340,7 +342,7 @@ const ControlPage = () => {
     return () => {
       cancelled = true;
     };
-  }, [assets.overlays, assets.videos, decks, getState, loadSource, remoteDeckMediaStates]);
+  }, [getState, loadSource, remoteDeckMediaStates, resolveDeckAssetSrc]);
 
   useEffect(() => {
     const nowSeconds = Date.now() / 1000;
@@ -536,7 +538,7 @@ const ControlPage = () => {
       });
       return didChange ? next : previous;
     });
-  }, [decks.a.opacity, decks.b.opacity, decks.c.opacity, decks.d.opacity]);
+  }, [decks]);
 
   const handleRegenerate = useCallback(() => {
     send({ type: 'regenerate-shader' });
@@ -565,26 +567,35 @@ const ControlPage = () => {
     (deck: DeckKey, value: string) => {
       if (!value) {
         sendDeckUpdate(deck, { type: null, assetId: null, opacity: 0 });
+        requestDeckSource(deck, null);
         return;
       }
 
       if (value === 'generative') {
         sendDeckUpdate(deck, { type: 'generative', assetId: null, opacity: 1 });
+        requestDeckSource(deck, null);
         return;
       }
 
       const [type, assetId] = value.split(':', 2);
       if (type === 'glsl' && assetId) {
         sendDeckUpdate(deck, { type: 'shader', assetId, opacity: 1 });
+        requestDeckSource(deck, null);
         return;
       }
 
       if (type === 'video' && assetId) {
         sendDeckUpdate(deck, { type: 'video', assetId, opacity: 1 });
+        const video =
+          assets.videos.find((item) => item.id === assetId) ??
+          assets.overlays?.find((item) => item.id === assetId);
+        const url =
+          video && 'url' in video && typeof video.url === 'string' ? video.url : null;
+        requestDeckSource(deck, url);
         return;
       }
     },
-    [sendDeckUpdate],
+    [assets.overlays, assets.videos, requestDeckSource, sendDeckUpdate],
   );
 
   const handleDeckOpacitySliderChange = useCallback(
