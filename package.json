@@ -1,0 +1,17 @@
+{
+  "name": "muloom-root",
+  "private": true,
+  "scripts": {
+    "dev": "concurrently -k \"python -m engine.main --host 0.0.0.0 --port 8080\" \"npm --prefix app/ui run dev\"",
+    "build": "npm --prefix app/ui run build",
+    "lint": "npm --prefix app/ui run lint",
+    "format": "npm --prefix app/ui run lint -- --fix",
+    "install:ui": "npm install --prefix app/ui",
+    "tauri": "npm --prefix app run tauri --",
+    "tauri:dev": "npm --prefix app run tauri:dev",
+    "tauri:build": "npm --prefix app run tauri:build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  }
+}

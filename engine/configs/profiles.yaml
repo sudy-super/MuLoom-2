@@ -1,0 +1,30 @@
+# Placeholder engine profiles
+
+default:
+  description: Default engine profile skeleton
+  preview:
+    width: 1280
+    height: 720
+    framerate: 30
+    bitrate: 8000000
+  outputs:
+    webrtc:
+      enabled: true
+      encoder: vtenc_h264
+    ndi:
+      enabled: false
+
+low-latency:
+  description: Low latency preset
+  preview:
+    width: 1280
+    height: 720
+    framerate: 60
+    bitrate: 6000000
+  outputs:
+    webrtc:
+      enabled: true
+      encoder: vtenc_h264
+      options:
+        realtime: true
+        allow-frame-reordering: false

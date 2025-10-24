@@ -1,0 +1,16 @@
+# Placeholder mapping between ISF uniforms and UI controls
+
+default:
+  float:
+    slider:
+      min: 0.0
+      max: 1.0
+  color:
+    picker: {}
+
+basic_time_controls:
+  uniforms:
+    TIME:
+      control: dial
+      min: 0.0
+      max: 60.0

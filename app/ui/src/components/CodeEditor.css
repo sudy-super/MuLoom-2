@@ -1,0 +1,220 @@
+.code-editor-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: transparent;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.code-editor-container {
+  width: 90%;
+  max-width: 1200px;
+  height: 80%;
+  background: rgba(30, 30, 30, 0.5);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border-radius: 0;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid rgba(45, 45, 48, 0.5);
+}
+
+.code-editor-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 20px;
+  background: rgba(45, 45, 48, 0.5);
+  border-bottom: 1px solid rgba(62, 62, 66, 0.5);
+}
+
+.code-editor-title {
+  font-size: 13px;
+  font-weight: 400;
+  color: #cccccc;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.code-editor-title::before {
+  content: '';
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  background: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="%23007ACC"><path d="M19.07 4.93L17.66 3.52 12 9.18 6.34 3.52 4.93 4.93 10.59 10.59 4.93 16.25 6.34 17.66 12 12 17.66 17.66 19.07 16.25 13.41 10.59z"/></svg>') no-repeat center;
+  background-size: contain;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.code-editor-spinner {
+  width: 16px;
+  height: 16px;
+  position: relative;
+}
+
+.code-editor-spinner::before,
+.code-editor-spinner::after {
+  content: '';
+  position: absolute;
+  width: 100%;
+  height: 100%;
+  border: 2px solid transparent;
+  border-top-color: #007ACC;
+  border-radius: 50%;
+  animation: vscode-spin 1.2s cubic-bezier(0.5, 0, 0.5, 1) infinite;
+}
+
+.code-editor-spinner::after {
+  border-top-color: #0098FF;
+  animation-delay: 0.15s;
+  opacity: 0.6;
+}
+
+@keyframes vscode-spin {
+  0% {
+    transform: rotate(0deg);
+  }
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.code-editor-content {
+  flex: 1;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: transparent;
+  color: #d4d4d4;
+  font-family: 'Consolas', 'Courier New', monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  letter-spacing: 0.02em;
+  display: flex;
+  position: relative;
+}
+
+.code-editor-lines {
+  background: rgba(30, 30, 30, 0.3);
+  backdrop-filter: blur(5px);
+  -webkit-backdrop-filter: blur(5px);
+  padding: 20px 0;
+  text-align: right;
+  user-select: none;
+  min-width: 50px;
+  border-right: 1px solid rgba(45, 45, 48, 0.5);
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.line-number {
+  padding: 0 16px 0 10px;
+  color: #858585;
+  font-size: 13px;
+  line-height: 1.5;
+  height: 19.5px;
+}
+
+.code-editor-code {
+  flex: 1;
+  margin: 0;
+  padding: 20px;
+  background: transparent;
+  color: #d4d4d4;
+  font-family: 'Consolas', 'Courier New', monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  letter-spacing: 0.02em;
+  white-space: pre;
+  overflow-y: auto;
+  overflow-x: auto;
+}
+
+.code-line {
+  min-height: 19.5px;
+  white-space: pre;
+}
+
+/* Scrollbar styling - VSCode style */
+.code-editor-code::-webkit-scrollbar {
+  width: 14px;
+  height: 14px;
+}
+
+.code-editor-code::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.code-editor-code::-webkit-scrollbar-thumb {
+  background: rgba(66, 66, 66, 0.7);
+  border: 3px solid transparent;
+  border-radius: 7px;
+}
+
+.code-editor-code::-webkit-scrollbar-thumb:hover {
+  background: rgba(78, 78, 78, 0.8);
+}
+
+.code-editor-code::-webkit-scrollbar-thumb:active {
+  background: rgba(80, 80, 80, 0.9);
+}
+
+/* GLSL Syntax Highlighting - VSCode Dark+ Theme */
+.keyword {
+  color: #569cd6; /* Blue - keywords like void, float, if, for */
+}
+
+.type {
+  color: #4ec9b0; /* Cyan - types like gl_FragColor, sampler2D */
+}
+
+.function {
+  color: #dcdcaa; /* Yellow - functions like sin, cos, mix */
+}
+
+.number {
+  color: #b5cea8; /* Light green - numbers */
+}
+
+.comment {
+  color: #6a9955; /* Green - comments */
+  font-style: italic;
+}
+
+.preprocessor {
+  color: #c586c0; /* Purple - preprocessor directives like #ifdef */
+}

@@ -1,0 +1,24 @@
+{
+  "productName": "MuLoom",
+  "version": "0.1.0",
+  "identifier": "com.muloom.controller",
+  "build": {
+    "beforeDevCommand": "bash ../scripts/dev_run.sh",
+    "beforeBuildCommand": "npm run build --prefix ./ui",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "security": {
+      "csp": null
+    },
+    "windows": [
+      {
+        "title": "MuLoom Controller",
+        "width": 1280,
+        "height": 800,
+        "center": true
+      }
+    ]
+  }
+}

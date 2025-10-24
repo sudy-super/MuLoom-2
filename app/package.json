@@ -1,0 +1,15 @@
+{
+  "name": "muloom-app",
+  "private": true,
+  "scripts": {
+    "tauri": "tauri",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "ui:dev": "npm run dev --prefix ui",
+    "ui:build": "npm run build --prefix ui"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.1",
+    "concurrently": "^9.2.1"
+  }
+}
