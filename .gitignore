@@ -20,6 +20,7 @@ app/ui/dist
 # Python virtual environments
 .venv/
 .uv/
+uv.lock
 
 # Python / caching
 __pycache__/
