@@ -65,6 +65,7 @@ export interface DeckTimelineState {
   isLoading: boolean;
   error: boolean;
   duration: number | null;
+  commandId?: string | null;
 }
 
 export const createDefaultDeckTimelineState = (): DeckTimelineState => ({
@@ -78,6 +79,7 @@ export const createDefaultDeckTimelineState = (): DeckTimelineState => ({
   isLoading: false,
   error: false,
   duration: null,
+  commandId: null,
 });
 
 export type DeckTimelineStateMap = Record<DeckKey, DeckTimelineState>;
@@ -97,7 +99,7 @@ export interface StartVisualizationPayload {
   prompt: string;
 }
 
-export type DeckMediaStateIntent =
+export type DeckMediaStateIntent = (
   | { intent: 'toggle'; isPlaying?: boolean }
   | { intent: 'play' }
   | { intent: 'pause' }
@@ -111,7 +113,8 @@ export type DeckMediaStateIntent =
       forceReload?: boolean;
     }
   | { intent: 'state'; value: Partial<DeckTimelineState> }
-  | Partial<DeckTimelineState>;
+  | Partial<DeckTimelineState>
+) & { commandId?: string };
 
 export interface DeckMediaStateMessagePayload<TState = DeckTimelineState> {
   deck: DeckKey;

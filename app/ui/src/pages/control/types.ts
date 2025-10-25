@@ -13,6 +13,7 @@ export type DeckMediaState = {
   isLoading: boolean;
   error: boolean;
   src: string | null;
+  commandId?: string | null;
 };
 
 export type DeckColumnOptions = {

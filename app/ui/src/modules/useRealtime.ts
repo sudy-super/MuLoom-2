@@ -50,16 +50,38 @@ const normaliseAssetUrls = (assets: FallbackAssets): FallbackAssets => {
     }
   };
 
+  const proxiedUrl = (rawUrl: string) => {
+    if (!rawUrl || !origin) {
+      return rawUrl;
+    }
+    try {
+      const candidate = new URL(rawUrl, origin);
+      const originUrl = new URL(origin);
+      if (candidate.origin === originUrl.origin) {
+        return candidate.toString();
+      }
+      return `${origin}/proxy/media?url=${encodeURIComponent(candidate.toString())}`;
+    } catch {
+      return rawUrl;
+    }
+  };
+
   return {
     glsl: assets.glsl ?? [],
-    videos: (assets.videos ?? []).map((video) => ({
-      ...video,
-      url: normaliseUrl(video.url),
-    })),
-    overlays: (assets.overlays ?? []).map((overlay) => ({
-      ...overlay,
-      url: normaliseUrl(overlay.url),
-    })),
+    videos: (assets.videos ?? []).map((video) => {
+      const resolved = normaliseUrl(video.url);
+      return {
+        ...video,
+        url: proxiedUrl(resolved),
+      };
+    }),
+    overlays: (assets.overlays ?? []).map((overlay) => {
+      const resolved = normaliseUrl(overlay.url);
+      return {
+        ...overlay,
+        url: proxiedUrl(resolved),
+      };
+    }),
   };
 };
 
@@ -138,6 +160,7 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
       Number.isFinite(explicitPositionRaw) && explicitPositionRaw >= 0 ? explicitPositionRaw : null;
     const elapsed = isPlaying ? Math.max(0, nowSeconds - updatedAt) : 0;
     const computedPosition = basePosition + elapsed * playRate;
+    const commandId = typeof (source as any).commandId === 'string' ? (source as any).commandId : null;
 
     return {
       src,
@@ -150,6 +173,7 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
       isLoading,
       error,
       duration,
+      commandId,
     };
   }, []);
 
@@ -177,6 +201,16 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
 
   const wsRef = useRef<WebSocket | null>(null);
   const handlersRef = useRef(handlers);
+  const commandCounterRef = useRef(0);
+  const latestCommandIdsRef = useRef<Record<DeckKey, string | null>>({ a: null, b: null, c: null, d: null });
+
+  const nextCommandId = useCallback((): string => {
+    commandCounterRef.current += 1;
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+    return `${Date.now()}-${commandCounterRef.current}`;
+  }, []);
 
   handlersRef.current = handlers;
 
@@ -192,15 +226,22 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
 
   const requestDeckState = useCallback(
     (deck: DeckKey, state: DeckMediaStateIntent) => {
+      if (role !== 'controller') {
+        return;
+      }
+      const commandId = nextCommandId();
+      const stateWithCommand = { ...state, commandId } as DeckMediaStateIntent;
+      latestCommandIdsRef.current[deck] = commandId;
       send({
         type: 'deck-media-state',
+        commandId,
         payload: {
           deck,
-          state,
+          state: stateWithCommand,
         },
       });
     },
-    [send],
+    [nextCommandId, send],
   );
 
   const requestDeckToggle = useCallback(
@@ -281,6 +322,22 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
     ws.onmessage = (event) => {
       try {
         const message: InboundMessage = JSON.parse(event.data);
+        if (message.type === 'ping') {
+          try {
+            ws.send(
+              JSON.stringify({
+                type: 'pong',
+                ts: typeof (message as any).ts === 'number' ? (message as any).ts : Date.now() / 1000,
+              }),
+            );
+          } catch (err) {
+            console.warn('Failed to reply pong', err);
+          }
+          return;
+        }
+        if (message.type === 'pong') {
+          return;
+        }
         if (message.type === 'rtc-signal') {
           handlersRef.current.onRTCSignal?.(message);
           return;
@@ -300,7 +357,9 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
                 | Partial<Record<DeckKey, Partial<DeckTimelineState>>>
                 | undefined;
               MIX_DECK_KEYS.forEach((key) => {
-                next[key] = resolveDeckTimelineState(incomingStates?.[key]);
+                const resolved = resolveDeckTimelineState(incomingStates?.[key]);
+                next[key] = resolved;
+                latestCommandIdsRef.current[key] = resolved.commandId ?? null;
               });
               return next;
             });
@@ -323,6 +382,10 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
             const incoming = resolveDeckTimelineState(message.payload.state);
             setDeckMediaStates((previous) => {
               const previousState = previous[deckKey] ?? createDefaultDeckTimelineState();
+              const expectedCommand = latestCommandIdsRef.current[deckKey];
+              if (incoming.commandId && expectedCommand && incoming.commandId !== expectedCommand) {
+                return previous;
+              }
               if (previousState.version > incoming.version) {
                 return previous;
               }
@@ -335,6 +398,7 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
                   'isLoading',
                   'error',
                   'duration',
+                  'commandId',
                 ];
                 const unchanged = keysToCompare.every(
                   (key) => previousState[key] === incoming[key],
@@ -342,6 +406,9 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
                 if (unchanged) {
                   return previous;
                 }
+              }
+              if (incoming.commandId) {
+                latestCommandIdsRef.current[deckKey] = incoming.commandId;
               }
               return {
                 ...previous,

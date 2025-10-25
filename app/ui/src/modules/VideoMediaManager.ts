@@ -7,6 +7,15 @@ type PreparedVideo = {
   source: string | MediaStream;
 };
 
+type SurfaceId = string;
+
+interface SurfaceDescriptor {
+  container: HTMLDivElement | null;
+  video: HTMLVideoElement | null;
+  stream: MediaStream | null;
+  isPrimary: boolean;
+}
+
 /**
  * Manages double-buffered <video> playback inside a container element.
  *
@@ -14,7 +23,6 @@ type PreparedVideo = {
  * visible elements never flicker to black during source changes.
  */
 export class VideoMediaManager {
-  private container: HTMLDivElement | null = null;
   private videoElement: HTMLVideoElement | null = null;
   private prepared: PreparedVideo | null = null;
   private currentSrc: string | null = null;
@@ -25,33 +33,420 @@ export class VideoMediaManager {
   private currentProgress = 0;
   private playAttempts = 0;
   private loadToken = 0;
+  private lastPlayPromise: Promise<void> | null = null;
+  private errorRecoveryAttempts = 0;
+  private static readonly MAX_ERROR_RECOVERY_ATTEMPTS = 3;
+  private static readonly FALLBACK_SYNC_INTERVAL_MS = 100;
+  private static readonly PLAYBACK_RATE_STEP = 0.25;
+  private targetPlaybackRate = 1.0;
+  private playbackRateRaf: number | null = null;
+  private surfaces: Map<SurfaceId, SurfaceDescriptor> = new Map();
+  private primarySurfaceId: SurfaceId | null = null;
+  private captureUnavailable = false;
+  private fallbackSyncHandle: number | null = null;
+  private static readonly FALLBACK_SYNC_INTERVAL_MS = 100;
 
-  registerContainer(element: HTMLDivElement | null) {
-    if (this.container === element) {
-      return;
+  registerSurface(surfaceId: SurfaceId, element: HTMLDivElement | null, options?: { primary?: boolean }) {
+    let surface = this.surfaces.get(surfaceId);
+    if (!surface) {
+      surface = {
+        container: null,
+        video: null,
+        stream: null,
+        isPrimary: false,
+      };
+      this.surfaces.set(surfaceId, surface);
     }
 
-    if (this.container && this.videoElement && this.videoElement.parentElement === this.container) {
-      this.container.removeChild(this.videoElement);
+    const wantsPrimary = Boolean(options?.primary);
+    if (wantsPrimary) {
+      this.assignPrimarySurface(surfaceId, surface);
+    } else if (!this.primarySurfaceId) {
+      this.assignPrimarySurface(surfaceId, surface);
     }
 
-    this.container = element;
+    if (surface.container && surface.container !== element) {
+      this.detachSurface(surfaceId, { keepVideo: true });
+    }
+
+    surface.container = element;
+    surface.isPrimary = this.primarySurfaceId === surfaceId;
 
     if (!element) {
+      if (surface.isPrimary) {
+        this.clearPrimarySurface(surfaceId);
+      }
+      this.detachSurface(surfaceId);
       return;
     }
 
-    element.replaceChildren();
-
-    if (this.videoElement) {
-      element.appendChild(this.videoElement);
-      return;
-    }
-
-    if (this.prepared) {
+    if (surface.isPrimary && !this.videoElement && this.prepared) {
       const { video, token } = this.prepared;
       this.commitPreparedVideo(video, token);
+      return;
     }
+
+    this.mountSurface(surfaceId);
+    this.refreshMirrorSurfaces();
+  }
+
+  private assignPrimarySurface(surfaceId: SurfaceId, surface: SurfaceDescriptor) {
+    if (this.primarySurfaceId === surfaceId) {
+      surface.isPrimary = true;
+      return;
+    }
+
+    const previousPrimaryId = this.primarySurfaceId;
+    if (previousPrimaryId) {
+      const previousSurface = this.surfaces.get(previousPrimaryId);
+      if (previousSurface) {
+        previousSurface.isPrimary = false;
+        this.detachSurface(previousPrimaryId, { keepVideo: true });
+      }
+    }
+
+    this.primarySurfaceId = surfaceId;
+    surface.isPrimary = true;
+
+    if (previousPrimaryId) {
+      const demotedSurface = this.surfaces.get(previousPrimaryId);
+      if (demotedSurface?.container) {
+        this.mountSurface(previousPrimaryId);
+      }
+    }
+  }
+
+  private clearPrimarySurface(surfaceId: SurfaceId) {
+    if (this.primarySurfaceId !== surfaceId) {
+      return;
+    }
+    const surface = this.surfaces.get(surfaceId);
+    if (surface) {
+      surface.isPrimary = false;
+    }
+    this.primarySurfaceId = null;
+    this.recalculatePrimarySurface(surfaceId);
+  }
+
+  private recalculatePrimarySurface(excludeId?: SurfaceId) {
+    if (this.primarySurfaceId) {
+      const currentSurface = this.surfaces.get(this.primarySurfaceId);
+      if (currentSurface && currentSurface.container) {
+        return;
+      }
+    }
+
+    this.primarySurfaceId = null;
+    for (const [candidateId, candidate] of this.surfaces) {
+      if (excludeId && candidateId === excludeId) {
+        candidate.isPrimary = false;
+        continue;
+      }
+      if (!candidate.container) {
+        candidate.isPrimary = false;
+        continue;
+      }
+      this.assignPrimarySurface(candidateId, candidate);
+      this.mountSurface(candidateId);
+      this.refreshMirrorSurfaces();
+      return;
+    }
+  }
+
+  private detachSurface(surfaceId: SurfaceId, options?: { keepVideo?: boolean }) {
+    const surface = this.surfaces.get(surfaceId);
+    if (!surface) {
+      return;
+    }
+    const container = surface.container;
+    const node = surface.isPrimary ? this.videoElement : surface.video;
+    if (container && node && node.parentElement === container) {
+      container.removeChild(node);
+    }
+    if (!surface.isPrimary) {
+      if (!options?.keepVideo && surface.video) {
+        this.disposeVideo(surface.video);
+        surface.video = null;
+      }
+      if (!options?.keepVideo) {
+        this.stopSurfaceStream(surface);
+      }
+    }
+  }
+
+  private mountSurface(surfaceId: SurfaceId) {
+    const surface = this.surfaces.get(surfaceId);
+    if (!surface) {
+      return;
+    }
+    const container = surface.container;
+    if (!container) {
+      return;
+    }
+
+    container.replaceChildren();
+
+    if (surface.isPrimary) {
+      if (this.videoElement) {
+        container.appendChild(this.videoElement);
+      }
+      return;
+    }
+
+    if (!surface.video) {
+      surface.video = this.createMirrorVideo();
+    }
+
+    container.appendChild(surface.video);
+    this.syncMirrorSurface(surfaceId);
+  }
+
+  private createMirrorVideo(): HTMLVideoElement {
+    const video = document.createElement('video');
+    video.crossOrigin = 'anonymous';
+    video.autoplay = true;
+    video.muted = true;
+    video.loop = true;
+    video.playsInline = true;
+    video.preload = 'auto';
+    video.controls = false;
+    video.style.width = '100%';
+    video.style.height = '100%';
+    video.style.objectFit = 'cover';
+    return video;
+  }
+
+  private syncMirrorSurface(surfaceId: SurfaceId) {
+    const surface = this.surfaces.get(surfaceId);
+    if (!surface || surface.isPrimary) {
+      return;
+    }
+
+    const mirrorVideo = surface.video;
+    if (!mirrorVideo) {
+      return;
+    }
+
+    const primary = this.videoElement;
+    if (!primary) {
+      this.stopSurfaceStream(surface);
+      mirrorVideo.srcObject = null;
+      mirrorVideo.removeAttribute('src');
+      return;
+    }
+
+    const stream = this.obtainCaptureStream(primary);
+    if (stream) {
+      if (surface.stream !== stream) {
+        this.stopSurfaceStream(surface);
+        surface.stream = stream;
+      }
+      try {
+        mirrorVideo.srcObject = stream;
+        mirrorVideo.removeAttribute('src');
+      } catch {
+        mirrorVideo.srcObject = null;
+      }
+      const playPromise = mirrorVideo.play();
+      if (playPromise && typeof playPromise.then === 'function') {
+        void playPromise.catch((error) => {
+          if (!this.isBenignPlayError(error)) {
+            console.warn('Mirror video play failed', error);
+          }
+        });
+      }
+      this.stopFallbackSync();
+    } else if (this.currentSrc) {
+      this.stopSurfaceStream(surface);
+      mirrorVideo.srcObject = null;
+      if (mirrorVideo.src !== this.currentSrc) {
+        mirrorVideo.src = this.currentSrc;
+        mirrorVideo.load();
+      }
+      const playPromise = mirrorVideo.play();
+      if (playPromise && typeof playPromise.then === 'function') {
+        void playPromise.catch((error) => {
+          if (!this.isBenignPlayError(error)) {
+            console.warn('Mirror video play failed', error);
+          }
+        });
+      }
+      this.startFallbackSync();
+    }
+  }
+
+  private obtainCaptureStream(video: HTMLVideoElement): MediaStream | null {
+    if (this.captureUnavailable) {
+      return null;
+    }
+    const candidate = video as HTMLVideoElement & {
+      captureStream?: () => MediaStream;
+      mozCaptureStream?: () => MediaStream;
+      webkitCaptureStream?: () => MediaStream;
+    };
+    try {
+      if (typeof candidate.captureStream === 'function') {
+        return candidate.captureStream();
+      }
+      if (typeof candidate.mozCaptureStream === 'function') {
+        return candidate.mozCaptureStream();
+      }
+      if (typeof candidate.webkitCaptureStream === 'function') {
+        return candidate.webkitCaptureStream();
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error ?? '');
+      const name = (error as { name?: string }).name ?? '';
+      const isSecurityError =
+        name === 'SecurityError' ||
+        message.toLowerCase().includes('securityerror') ||
+        message.toLowerCase().includes('cross-origin');
+      if (isSecurityError) {
+        this.captureUnavailable = true;
+        console.info(
+          'captureStream disabled for this deck due to cross-origin restrictions; falling back to direct source duplication.',
+        );
+        this.startFallbackSync();
+      } else {
+        console.warn('Failed to capture stream from video', error);
+      }
+    }
+    return null;
+  }
+
+  private stopSurfaceStream(surface: SurfaceDescriptor) {
+    if (surface.stream) {
+      surface.stream.getTracks().forEach((track) => {
+        try {
+          track.stop();
+        } catch {
+          // ignore track stop errors
+        }
+      });
+      surface.stream = null;
+    }
+  }
+
+  private refreshMirrorSurfaces() {
+    for (const [surfaceId, surface] of this.surfaces) {
+      if (!surface.isPrimary) {
+        this.syncMirrorSurface(surfaceId);
+      }
+    }
+  }
+
+  private resetMirrorSurfaces() {
+    for (const surface of this.surfaces.values()) {
+      if (surface.isPrimary) {
+        continue;
+      }
+      if (surface.video) {
+        surface.video.srcObject = null;
+        surface.video.removeAttribute('src');
+      }
+      this.stopSurfaceStream(surface);
+    }
+  }
+
+  private startFallbackSync() {
+    if (!this.captureUnavailable) {
+      return;
+    }
+    if (this.fallbackSyncHandle !== null) {
+      return;
+    }
+    const sync = () => {
+      if (!this.captureUnavailable) {
+        this.stopFallbackSync();
+        return;
+      }
+      this.synchroniseMirrorsFromPrimary();
+      this.fallbackSyncHandle = window.setTimeout(sync, VideoMediaManager.FALLBACK_SYNC_INTERVAL_MS);
+    };
+    this.fallbackSyncHandle = window.setTimeout(sync, VideoMediaManager.FALLBACK_SYNC_INTERVAL_MS);
+  }
+
+  private stopFallbackSync() {
+    if (this.fallbackSyncHandle !== null) {
+      window.clearTimeout(this.fallbackSyncHandle);
+      this.fallbackSyncHandle = null;
+    }
+  }
+
+  private synchroniseMirrorsFromPrimary() {
+    const primary = this.videoElement;
+    if (!primary) {
+      return;
+    }
+
+    const targetTime = primary.currentTime;
+    const shouldPlay = !primary.paused;
+    const playbackRate = primary.playbackRate || 1;
+    const targetPaused = primary.paused;
+
+    for (const surface of this.surfaces.values()) {
+      if (surface.isPrimary || !surface.video) {
+        continue;
+      }
+      const mirror = surface.video;
+
+      if (mirror.readyState >= HTMLMediaElement.HAVE_METADATA) {
+        if (Math.abs(mirror.currentTime - targetTime) > 0.2) {
+          try {
+            const fastSeek = (mirror as HTMLMediaElement & { fastSeek?: (time: number) => void }).fastSeek;
+            if (typeof fastSeek === 'function') {
+              fastSeek.call(mirror, targetTime);
+            } else {
+              mirror.currentTime = targetTime;
+            }
+          } catch {
+            // ignore seek errors
+          }
+        }
+      }
+
+      if (Math.abs(mirror.playbackRate - playbackRate) > 0.005) {
+        try {
+          mirror.playbackRate = playbackRate;
+        } catch {
+          // ignore playback rate errors
+        }
+      }
+
+      if (!targetPaused) {
+        if (mirror.paused) {
+          const playPromise = mirror.play();
+          if (playPromise && typeof playPromise.catch === 'function') {
+            playPromise.catch((error) => {
+              if (!this.isBenignPlayError(error)) {
+                console.warn('Mirror video play failed', error);
+              }
+            });
+          }
+        }
+      } else if (!mirror.paused) {
+        try {
+          mirror.pause();
+        } catch {
+          // ignore pause errors
+        }
+      }
+    }
+  }
+
+  private isBenignPlayError(error: unknown): boolean {
+    if (!error) {
+      return true;
+    }
+    const message = typeof error === 'string' ? error : (error as Error).message ?? '';
+    const name = (error as Error & { name?: string }).name ?? '';
+    const lower = message.toLowerCase();
+    return (
+      name === 'AbortError' ||
+      lower.includes('interrupted by a call to pause') ||
+      lower.includes('interrupted by a new load request') ||
+      lower.includes('the play() request was interrupted')
+    );
   }
 
   async loadSource(src: string | null): Promise<boolean> {
@@ -60,12 +455,33 @@ export class VideoMediaManager {
     if (!src) {
       await this.cleanupCurrentSource({ resetState: true });
       this.currentSrc = null;
+      this.errorRecoveryAttempts = 0;
+      return true;
+    }
+
+    if (
+      this.currentSrc === src &&
+      this.videoElement &&
+      this.state !== 'idle' &&
+      this.state !== 'error'
+    ) {
+      if (!this.videoElement.paused && this.playbackRate !== this.targetPlaybackRate) {
+        this.schedulePlaybackRateUpdate();
+      }
+      this.pendingPlay = true;
+      this.refreshMirrorSurfaces();
       return true;
     }
 
     await this.cleanupPreparedVideo();
 
+    const isNewSource = this.currentSrc !== src;
     this.currentSrc = src;
+    if (isNewSource) {
+      this.errorRecoveryAttempts = 0;
+      this.captureUnavailable = false;
+      this.stopFallbackSync();
+    }
     this.setState('loading');
 
     try {
@@ -76,7 +492,8 @@ export class VideoMediaManager {
       }
 
       this.prepared = { video: preparedVideo, token, source: src };
-      if (this.container) {
+      const primarySurface = this.primarySurfaceId ? this.surfaces.get(this.primarySurfaceId) : null;
+      if (primarySurface?.container) {
         this.commitPreparedVideo(preparedVideo, token);
       }
       return true;
@@ -122,6 +539,27 @@ export class VideoMediaManager {
       return;
     }
 
+    const pauseVideo = () => {
+      try {
+        this.videoElement!.pause();
+        this.setState('paused');
+      } catch {
+        // ignore pause errors
+      }
+    };
+
+    if (this.lastPlayPromise) {
+      this.lastPlayPromise
+        .catch(() => {
+          // ignore errors from the previous play attempt
+        })
+        .finally(() => {
+          pauseVideo();
+        });
+      this.lastPlayPromise = null;
+      return;
+    }
+
     try {
       this.videoElement.pause();
       this.setState('paused');
@@ -131,9 +569,15 @@ export class VideoMediaManager {
   }
 
   setPlaybackRate(rate: number) {
-    const clampedRate = Math.max(0, Math.min(4, rate));
-    this.playbackRate = clampedRate;
-    this.applyPlaybackRate(clampedRate);
+    const clampedRate = Math.max(0, Math.min(5, rate));
+    this.targetPlaybackRate = clampedRate;
+    if (!this.videoElement) {
+      this.playbackRate = clampedRate;
+      return clampedRate;
+    }
+    if (this.playbackRateRaf === null) {
+      this.schedulePlaybackRateUpdate();
+    }
 
     if (clampedRate <= 0.0001 && this.state === 'playing') {
       this.pause();
@@ -193,10 +637,31 @@ export class VideoMediaManager {
       this.videoElement = null;
     }
 
-    this.container = null;
+    for (const surfaceId of Array.from(this.surfaces.keys())) {
+      this.detachSurface(surfaceId);
+      const surface = this.surfaces.get(surfaceId);
+      if (surface) {
+        if (surface.video) {
+          this.disposeVideo(surface.video);
+          surface.video = null;
+        }
+        this.stopSurfaceStream(surface);
+        surface.container = null;
+        surface.isPrimary = false;
+      }
+    }
+    this.surfaces.clear();
+    this.primarySurfaceId = null;
+
     this.currentSrc = null;
     this.state = 'idle';
     this.eventListeners.clear();
+    this.captureUnavailable = false;
+    this.stopFallbackSync();
+    if (this.playbackRateRaf !== null) {
+      window.cancelAnimationFrame(this.playbackRateRaf);
+      this.playbackRateRaf = null;
+    }
   }
 
   getState() {
@@ -233,8 +698,17 @@ export class VideoMediaManager {
     }
     this.disposeVideo(video);
 
+    this.resetMirrorSurfaces();
+
     if (resetState && this.state !== 'idle') {
       this.setState('idle');
+    }
+
+    this.captureUnavailable = false;
+    this.stopFallbackSync();
+    if (this.playbackRateRaf !== null) {
+      window.cancelAnimationFrame(this.playbackRateRaf);
+      this.playbackRateRaf = null;
     }
   }
 
@@ -251,6 +725,7 @@ export class VideoMediaManager {
     token: number,
   ): Promise<HTMLVideoElement> {
     const video = document.createElement('video');
+    video.crossOrigin = 'anonymous';
     video.autoplay = true;
     video.muted = true;
     video.loop = true;
@@ -365,14 +840,21 @@ export class VideoMediaManager {
     this.applyPlaybackRate(this.playbackRate);
     this.setupVideoElement(video);
 
-    if (this.container && video.parentElement !== this.container) {
-      this.container.appendChild(video);
+    if (!this.primarySurfaceId) {
+      this.recalculatePrimarySurface();
+    }
+
+    if (this.primarySurfaceId) {
+      this.mountSurface(this.primarySurfaceId);
     }
 
     this.pendingPlay = true;
     this.playAttempts = 0;
+    this.errorRecoveryAttempts = 0;
     this.setState('ready');
     this.attemptPlayback();
+    this.refreshMirrorSurfaces();
+    this.schedulePlaybackRateUpdate();
   }
 
   private disposeVideo(video: HTMLVideoElement) {
@@ -435,6 +917,34 @@ export class VideoMediaManager {
     }
   }
 
+  private schedulePlaybackRateUpdate() {
+    if (this.playbackRateRaf !== null) {
+      return;
+    }
+    const stepUpdate = () => {
+      if (!this.videoElement) {
+        this.playbackRateRaf = null;
+        this.playbackRate = this.targetPlaybackRate;
+        return;
+      }
+      const current = this.videoElement.playbackRate;
+      const target = this.targetPlaybackRate;
+      const diff = target - current;
+      if (Math.abs(diff) <= 0.01) {
+        this.applyPlaybackRate(target);
+        this.playbackRate = target;
+        this.playbackRateRaf = null;
+        return;
+      }
+      const step = Math.sign(diff) * Math.min(Math.abs(diff), VideoMediaManager.PLAYBACK_RATE_STEP);
+      const next = current + step;
+      this.applyPlaybackRate(next);
+      this.playbackRate = next;
+      this.playbackRateRaf = window.requestAnimationFrame(stepUpdate);
+    };
+    this.playbackRateRaf = window.requestAnimationFrame(stepUpdate);
+  }
+
   private attemptPlayback() {
     if (!this.videoElement || this.state === 'playing') {
       return;
@@ -445,12 +955,27 @@ export class VideoMediaManager {
     try {
       const playPromise = this.videoElement.play();
       if (playPromise && typeof playPromise.then === 'function') {
-        playPromise
+        this.lastPlayPromise = playPromise
           .then(() => {
-            this.setState('playing');
+            this.lastPlayPromise = null;
+            if (this.pendingPlay || !this.videoElement?.paused) {
+              this.setState('playing');
+            }
             this.playAttempts = 0;
           })
           .catch((error) => {
+            this.lastPlayPromise = null;
+            if (this.isBenignAbort(error)) {
+              if (this.pendingPlay) {
+                setTimeout(() => {
+                  if (this.pendingPlay) {
+                    this.attemptPlayback();
+                  }
+                }, 100);
+              }
+              return;
+            }
+
             console.warn('Video play attempt failed', error);
             if (this.pendingPlay && this.playAttempts <= 5) {
               setTimeout(() => {
@@ -470,6 +995,20 @@ export class VideoMediaManager {
       console.warn('Video play attempt error', error);
       this.setState('paused', { error });
     }
+  }
+
+  private isBenignAbort(error: unknown): boolean {
+    if (!error) {
+      return false;
+    }
+    const message = typeof error === 'string' ? error : (error as Error).message ?? '';
+    const name = (error as Error & { name?: string }).name ?? '';
+    const normalisedMessage = message.toLowerCase();
+    return (
+      name === 'AbortError' ||
+      normalisedMessage.includes('interrupted by a call to pause') ||
+      normalisedMessage.includes('play() request was interrupted')
+    );
   }
 
   private setupVideoElement(element: HTMLVideoElement) {
@@ -628,12 +1167,46 @@ export class VideoMediaManager {
     }
 
     console.error('Video error', mediaError);
+    const wasPendingPlay = this.pendingPlay || (this.state === 'playing' && !video.paused);
     this.pendingPlay = false;
     this.setState('error', {
       videoError: mediaError ?? null,
       errorCode: mediaError?.code,
       errorMessage,
     });
+
+    const shouldAttemptRecovery =
+      !!this.currentSrc && this.errorRecoveryAttempts < VideoMediaManager.MAX_ERROR_RECOVERY_ATTEMPTS;
+
+    if (!shouldAttemptRecovery) {
+      return;
+    }
+
+    const attemptNumber = ++this.errorRecoveryAttempts;
+    const resumePlayback = wasPendingPlay;
+    const targetSrc = this.currentSrc;
+    const snapshotPlaybackRate = this.targetPlaybackRate;
+    const safePlaybackRate = Math.min(snapshotPlaybackRate, 2);
+    this.targetPlaybackRate = safePlaybackRate;
+    this.playbackRate = safePlaybackRate;
+    this.applyPlaybackRate(safePlaybackRate);
+
+    setTimeout(() => {
+      if (!targetSrc || targetSrc !== this.currentSrc) {
+        return;
+      }
+
+      void this.loadSource(targetSrc).then((loaded) => {
+        if (!loaded) {
+          return;
+        }
+        this.setPlaybackRate(snapshotPlaybackRate);
+        if (resumePlayback) {
+          this.pendingPlay = true;
+          this.play();
+        }
+      });
+    }, Math.min(2000, 300 * attemptNumber));
   };
 
   private handleEnded = (event: Event) => {

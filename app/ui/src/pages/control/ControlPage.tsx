@@ -28,10 +28,10 @@ import { ContentBrowser } from './components/ContentBrowser';
 const emptyDeck: MixDeck = { type: null, assetId: null, opacity: 0, enabled: false };
 
 const createDefaultDeckMediaState = (): Record<DeckKey, DeckMediaState> => ({
-  a: { isPlaying: false, progress: 0, isLoading: false, error: false, src: null },
-  b: { isPlaying: false, progress: 0, isLoading: false, error: false, src: null },
-  c: { isPlaying: false, progress: 0, isLoading: false, error: false, src: null },
-  d: { isPlaying: false, progress: 0, isLoading: false, error: false, src: null },
+  a: { isPlaying: false, progress: 0, isLoading: false, error: false, src: null, commandId: null },
+  b: { isPlaying: false, progress: 0, isLoading: false, error: false, src: null, commandId: null },
+  c: { isPlaying: false, progress: 0, isLoading: false, error: false, src: null, commandId: null },
+  d: { isPlaying: false, progress: 0, isLoading: false, error: false, src: null, commandId: null },
 });
 
 const ControlPage = () => {
@@ -129,7 +129,7 @@ const ControlPage = () => {
     () =>
       deckKeys.reduce((accumulator, key) => {
         accumulator[key] = (element: HTMLDivElement | null) => {
-          registerContainer(`deck-${key}`, element);
+          registerContainer(`deck-${key}`, element, { primary: true });
         };
         return accumulator;
       }, {} as Record<DeckKey, (element: HTMLDivElement | null) => void>),
@@ -140,7 +140,7 @@ const ControlPage = () => {
     () =>
       deckKeys.reduce((accumulator, key) => {
         accumulator[key] = (element: HTMLDivElement | null) => {
-          registerContainer(`master-${key}`, element);
+          registerContainer(`master-${key}`, element, { primary: false });
         };
         return accumulator;
       }, {} as Record<DeckKey, (element: HTMLDivElement | null) => void>),
@@ -499,9 +499,10 @@ const ControlPage = () => {
       const localSlider = localSensitivityValues[deckKey] ?? 50;
       const multiplier =
         mapSliderToSensitivity(localSlider) ?? clampSensitivityValue(audioSensitivity);
+      const cappedMultiplier = Math.min(5, Math.max(0, multiplier));
       const remoteRate = remoteDeckMediaStates[deckKey]?.playRate ?? 1;
-      if (Math.abs(remoteRate - multiplier) > 0.01) {
-        requestDeckRate(deckKey, multiplier);
+      if (Math.abs(remoteRate - cappedMultiplier) > 0.01) {
+        requestDeckRate(deckKey, cappedMultiplier);
       }
     });
   }, [
@@ -548,10 +549,11 @@ const ControlPage = () => {
   const handleAudioSensitivity = useCallback(
     (value: number) => {
       const clampedValue = clampSensitivityValue(value);
-      setAudioSensitivity(clampedValue);
-      send({ type: 'set-audio-sensitivity', payload: { value: clampedValue } });
+      const cappedValue = Math.min(5, Math.max(0, clampedValue));
+      setAudioSensitivity(cappedValue);
+      send({ type: 'set-audio-sensitivity', payload: { value: cappedValue } });
       deckKeys.forEach((deckKey) => {
-        requestDeckRate(deckKey, clampedValue);
+        requestDeckRate(deckKey, cappedValue);
       });
     },
     [requestDeckRate, send],
@@ -778,7 +780,7 @@ const ControlPage = () => {
         [deckKey]: clampedSlider,
       }));
       const nextMultiplier = clampSensitivityValue(mapSliderToSensitivity(clampedSlider));
-      requestDeckRate(deckKey, nextMultiplier);
+      requestDeckRate(deckKey, Math.min(5, Math.max(0, nextMultiplier)));
     },
     [requestDeckRate],
   );

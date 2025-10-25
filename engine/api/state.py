@@ -4,10 +4,12 @@ Shared engine state container.
 
 from __future__ import annotations
 
+import asyncio
+from collections import deque
 from dataclasses import dataclass, field
 import logging
-from typing import Dict, List, Optional, Tuple
 import time
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from ..graph.mixers import MixerLayer
 from ..pipeline import Pipeline
@@ -154,6 +156,7 @@ class DeckMediaState:
     duration: float | None = None
     last_load_revision: int = 0
     _updated_at_monotonic: float = field(default_factory=time.monotonic, repr=False)
+    last_command_id: str | None = None
 
     def _normalise_src(self, value) -> str | None:
         if isinstance(value, str):
@@ -335,7 +338,128 @@ class DeckMediaState:
             "error": bool(self.error),
             "duration": self.duration,
             "loadRevision": int(self.last_load_revision),
+            "commandId": self.last_command_id,
         }
+
+
+@dataclass(frozen=True)
+class DeckHandle:
+    """Immutable handle describing an active deck instance."""
+
+    deck_id: str
+    epoch: int
+    src: Optional[str]
+    command_id: str
+    metadata: Dict[str, object]
+    created_at: float = field(default_factory=time.time)
+
+
+class DeckLoadError(RuntimeError):
+    """Raised when a deck fails to load or initialise."""
+
+
+class DeckManager:
+    """RCU manager that hot-swaps deck instances in a safe manner."""
+
+    def __init__(self, *, grace_period: float = 5.0, command_cache: int = 1024) -> None:
+        self._current: Dict[str, DeckHandle] = {}
+        self._epochs: Dict[str, int] = {}
+        self._locks: Dict[str, asyncio.Lock] = {}
+        self._retired: Dict[str, deque[DeckHandle]] = {}
+        self._seen_commands: Dict[str, str] = {}
+        self._command_order: deque[str] = deque()
+        self._grace_period = max(0.0, float(grace_period))
+        self._command_cache_size = max(16, int(command_cache))
+
+    async def current(self, deck_id: str) -> Optional[DeckHandle]:
+        """Return the active handle for ``deck_id`` if one exists."""
+
+        return self._current.get(deck_id)
+
+    async def load(
+        self,
+        deck_id: str,
+        src: Optional[str],
+        command_id: str,
+        builder: Callable[[str, Optional[str], int], Awaitable[Dict[str, object]]],
+    ) -> Tuple[DeckHandle, bool]:
+        """Prepare and activate a new deck instance.
+
+        Args:
+            deck_id: Logical deck identifier.
+            src: Requested media source.
+            command_id: Caller-supplied idempotency token.
+            builder: Async callable that constructs the deck and returns
+                metadata describing the instance.
+
+        Returns:
+            ``(handle, is_new)`` where ``is_new`` indicates whether a fresh
+            instance was created (``True``) or an existing handle was reused due
+            to an idempotent ``commandId`` (``False``).
+        """
+
+        if not command_id:
+            raise DeckLoadError("commandId is required for load operations")
+
+        cached_deck_id = self._seen_commands.get(command_id)
+        if cached_deck_id == deck_id and deck_id in self._current:
+            return self._current[deck_id], False
+
+        lock = self._locks.setdefault(deck_id, asyncio.Lock())
+        async with lock:
+            cached_deck_id = self._seen_commands.get(command_id)
+            if cached_deck_id == deck_id and deck_id in self._current:
+                return self._current[deck_id], False
+
+            next_epoch = self._epochs.get(deck_id, 0) + 1
+
+            try:
+                metadata = await builder(deck_id, src, next_epoch)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive guard
+                raise DeckLoadError(str(exc)) from exc
+
+            handle = DeckHandle(
+                deck_id=deck_id,
+                epoch=next_epoch,
+                src=src,
+                command_id=command_id,
+                metadata=dict(metadata or {}),
+            )
+
+            previous = self._current.get(deck_id)
+            self._current[deck_id] = handle
+            self._epochs[deck_id] = next_epoch
+
+            self._seen_commands[command_id] = deck_id
+            self._command_order.append(command_id)
+            while len(self._command_order) > self._command_cache_size:
+                evicted = self._command_order.popleft()
+                if evicted != command_id:
+                    self._seen_commands.pop(evicted, None)
+
+            if previous:
+                retired = self._retired.setdefault(deck_id, deque())
+                retired.append(previous)
+                if self._grace_period:
+                    asyncio.create_task(self._finalise_after_grace(deck_id, previous))
+                else:
+                    retired.clear()
+
+            return handle, True
+
+    async def _finalise_after_grace(self, deck_id: str, handle: DeckHandle) -> None:
+        await asyncio.sleep(self._grace_period)
+        lock = self._locks.setdefault(deck_id, asyncio.Lock())
+        async with lock:
+            retired = self._retired.get(deck_id)
+            if not retired:
+                return
+            try:
+                retired.remove(handle)
+            except ValueError:
+                return
 
 
 @dataclass

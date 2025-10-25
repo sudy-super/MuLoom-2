@@ -153,7 +153,7 @@ const ViewerPage = () => {
     () =>
       MIX_DECK_KEYS.reduce((accumulator, key) => {
         accumulator[key] = (element: HTMLDivElement | null) => {
-          registerManagedContainer(`viewer-${key}`, element);
+          registerManagedContainer(`viewer-${key}`, element, { primary: true });
         };
         return accumulator;
       }, {} as Record<DeckKey, (element: HTMLDivElement | null) => void>),
