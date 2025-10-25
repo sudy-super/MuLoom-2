@@ -87,6 +87,7 @@ const ControlPage = () => {
     requestDeckToggle,
     requestDeckSeek,
     requestDeckRate,
+    requestDeckPlay,
     requestDeckSource,
     requestDeckState,
   } = useRealtime('controller', {
@@ -626,8 +627,14 @@ const ControlPage = () => {
             error: false,
           },
         }));
-        requestDeckSource(deck, url);
-        requestDeckSeek(deck, 0, { resume: previousDeckState?.isPlaying ?? false });
+        const shouldResume = previousDeckState?.isPlaying ?? false;
+        const remoteSrc = remoteDeckMediaStates[deck]?.src ?? null;
+        const shouldReload = remoteSrc === url;
+        requestDeckSource(deck, url, { reload: shouldReload });
+        requestDeckSeek(deck, 0, { resume: shouldResume });
+        if (shouldResume) {
+          requestDeckPlay(deck);
+        }
         return;
       }
     },
@@ -636,7 +643,9 @@ const ControlPage = () => {
       assets.videos,
       deckStates,
       decks,
+      remoteDeckMediaStates,
       requestDeckSeek,
+      requestDeckPlay,
       requestDeckSource,
       sendDeckUpdate,
       setDeckStates,

@@ -48,21 +48,6 @@ export class VideoMediaManager {
       return true;
     }
 
-    const shouldForceReload =
-      this.videoElement != null &&
-      this.videoElement.getAttribute('src') !== src &&
-      this.videoElement.src !== src;
-
-    if (
-      this.currentSrc === src &&
-      this.state !== 'idle' &&
-      this.state !== 'error' &&
-      !shouldForceReload &&
-      (this.videoElement?.readyState ?? 0) > 0
-    ) {
-      return true;
-    }
-
     await this.cleanupCurrentSource();
 
     if (token !== this.loadToken) {
@@ -78,17 +63,30 @@ export class VideoMediaManager {
       return false;
     }
 
-    try {
-      await this.loadVideoSourceAsync(src, token);
-      return true;
-    } catch (error) {
-      if (token === this.loadToken) {
-        this.pendingPlay = false;
-        const loadError = error instanceof Error ? error : new Error(String(error));
-        this.setState('error', { videoError: loadError });
+    const maxAttempts = 3;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const attemptUrl = this.buildCacheBustedUrl(src, token + attempt);
+      try {
+        await this.loadVideoSourceAsync(attemptUrl, token);
+        return true;
+      } catch (error) {
+        if (token !== this.loadToken) {
+          return false;
+        }
+
+        const isLastAttempt = attempt >= maxAttempts - 1;
+        if (isLastAttempt) {
+          this.pendingPlay = false;
+          const loadError = error instanceof Error ? error : new Error(String(error));
+          this.setState('error', { videoError: loadError });
+          return false;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 200 * (attempt + 1)));
       }
-      return false;
     }
+
+    return false;
   }
 
   private cleanupCurrentSource(options: { resetState?: boolean } = {}): Promise<void> {
@@ -123,6 +121,12 @@ export class VideoMediaManager {
     }
 
     try {
+      video.src = '';
+    } catch {
+      // ignore reset errors
+    }
+
+    try {
       video.load();
     } catch {
       // ignore load errors
@@ -146,12 +150,14 @@ export class VideoMediaManager {
 
     return new Promise<void>((resolve, reject) => {
       let settled = false;
-      let timeoutId: ReturnType<typeof setTimeout>;
+      let timeoutId: ReturnType<typeof setTimeout> | null = null;
 
       const cleanup = () => {
         video.removeEventListener('loadeddata', handleLoadedData);
         video.removeEventListener('error', handleError);
-        clearTimeout(timeoutId);
+        if (timeoutId !== null) {
+          clearTimeout(timeoutId);
+        }
       };
 
       const resolveSafely = () => {
@@ -217,6 +223,22 @@ export class VideoMediaManager {
         rejectSafely(loadError);
       }
     });
+  }
+
+  private buildCacheBustedUrl(src: string, token: number): string {
+    const stamp = `${Date.now()}-${token}`;
+    if (/^(blob:|data:)/i.test(src)) {
+      return src;
+    }
+    try {
+      const base = typeof window !== 'undefined' ? window.location.href : undefined;
+      const url = base ? new URL(src, base) : new URL(src);
+      url.searchParams.set('_ts', stamp);
+      return url.toString();
+    } catch {
+      const separator = src.includes('?') ? '&' : '?';
+      return `${src}${separator}_ts=${stamp}`;
+    }
   }
 
   play() {
@@ -540,6 +562,11 @@ export class VideoMediaManager {
   private handleError = (event: Event) => {
     const video = event.target as HTMLVideoElement;
     if (video !== this.videoElement) {
+      return;
+    }
+
+    const hasActiveSource = Boolean(video.currentSrc || video.src || this.currentSrc);
+    if (!hasActiveSource) {
       return;
     }
 

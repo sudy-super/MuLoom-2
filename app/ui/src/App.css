@@ -1089,7 +1089,7 @@ canvas.fallback-layer {
 }
 
 .dj-vertical-fader {
-  -webkit-appearance: slider-vertical;
+  -webkit-appearance: none;
   -moz-appearance: none;
   appearance: none;
   width: 4px;

@@ -103,7 +103,13 @@ export type DeckMediaStateIntent =
   | { intent: 'pause' }
   | { intent: 'seek'; position?: number; value?: number; resume?: boolean }
   | { intent: 'rate' | 'speed'; value: number }
-  | { intent: 'source' | 'src'; src?: string | null; value?: string | null }
+  | {
+      intent: 'source' | 'src';
+      src?: string | null;
+      value?: string | null;
+      reload?: boolean;
+      forceReload?: boolean;
+    }
   | { intent: 'state'; value: Partial<DeckTimelineState> }
   | Partial<DeckTimelineState>;
 

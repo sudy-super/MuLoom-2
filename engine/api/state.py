@@ -272,6 +272,11 @@ class DeckMediaState:
             if target_src != self.src:
                 self.src = target_src
                 changed = True
+            else:
+                # Treat re-applying the same source as a meaningful transition so that
+                # downstream consumers (UI, pipeline) can force a reload and refresh.
+                if target_src is not None or payload.get("forceReload") or payload.get("reload"):
+                    changed = True
 
         elif intent == "state":
             nested_payload = payload.get("value")
@@ -402,13 +407,28 @@ class EngineState:
         state = self.deck_media_states.get(deck_key)
         if not state:
             return False
+
         previous_src = state.src
-        changed = state.apply_request(payload or {})
-        if changed and previous_src != state.src:
+        reload_requested = False
+
+        state_payload = payload or {}
+        intent = str(state_payload.get("intent") or "").lower()
+        target_src = None
+        if intent in {"source", "src"}:
+            target_src = state._normalise_src(state_payload.get("src") or state_payload.get("value"))
+            if state_payload.get("forceReload") or state_payload.get("reload"):
+                reload_requested = True
+            elif target_src is not None and target_src == previous_src:
+                reload_requested = True
+
+        changed = state.apply_request(state_payload)
+
+        if changed and (previous_src != state.src or reload_requested):
             try:
                 self.pipeline.set_deck_source(deck_key, state.src)
             except Exception:  # pragma: no cover - defensive
                 LOG.exception("Failed to update pipeline source for deck '%s'", deck_key)
+
         return changed
 
     def mixer_layers(self) -> Dict[str, MixerLayer]:

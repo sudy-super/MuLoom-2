@@ -243,8 +243,11 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
   );
 
   const requestDeckSource = useCallback(
-    (deck: DeckKey, src: string | null) => {
-      requestDeckState(deck, { intent: 'source', src });
+    (deck: DeckKey, src: string | null, options?: { reload?: boolean }) => {
+      const state: DeckMediaStateIntent = options?.reload
+        ? { intent: 'source', src, reload: true, forceReload: true }
+        : { intent: 'source', src };
+      requestDeckState(deck, state);
     },
     [requestDeckState],
   );
@@ -425,8 +428,33 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
     };
 
     return () => {
-      ws.close();
+      const socket = wsRef.current;
       wsRef.current = null;
+
+      if (!socket) {
+        setConnectionState('closed');
+        return;
+      }
+
+      const closeSafely = () => {
+        if (socket.readyState === WebSocket.CLOSING || socket.readyState === WebSocket.CLOSED) {
+          return;
+        }
+        try {
+          socket.close(1000, 'cleanup');
+        } catch {
+          // Ignore close errors triggered during tear down.
+        }
+      };
+
+      if (socket.readyState === WebSocket.CONNECTING) {
+        const abort = () => closeSafely();
+        socket.addEventListener('open', abort, { once: true });
+        socket.addEventListener('error', abort, { once: true });
+      } else if (socket.readyState === WebSocket.OPEN) {
+        closeSafely();
+      }
+
       setConnectionState('closed');
     };
   }, [role, normaliseMixState, createDefaultDeckMediaStates, resolveDeckTimelineState]);
