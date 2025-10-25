@@ -4,10 +4,64 @@ Asset discovery utilities.
 
 from __future__ import annotations
 
+import os
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterable, List, Optional
 
-ROOT_DIR = Path(__file__).resolve().parents[2]
+ENV_ROOT_VAR = "MULOOM_ROOT"
+
+
+def _is_project_root(path: Path) -> bool:
+    return (path / "mp4").exists() or (path / "glsl").exists()
+
+
+def _iter_unique(paths: Iterable[Optional[Path]]) -> Iterable[Path]:
+    seen: set[Path] = set()
+    for path in paths:
+        if path is None:
+            continue
+        try:
+            resolved = path.resolve()
+        except FileNotFoundError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        yield resolved
+
+
+@lru_cache(maxsize=1)
+def _discover_root_dir() -> Path:
+    env_root = os.environ.get(ENV_ROOT_VAR)
+    if env_root:
+        candidate = Path(env_root).expanduser()
+        if _is_project_root(candidate):
+            return candidate.resolve()
+
+    module_path = Path(__file__).resolve()
+    module_root = module_path.parent.parent.parent
+    cwd = Path.cwd()
+
+    candidates = list(
+        _iter_unique(
+            [
+                module_root,
+                cwd,
+                *module_path.parents,
+                *cwd.parents,
+            ]
+        )
+    )
+
+    for candidate in candidates:
+        if _is_project_root(candidate):
+            return candidate
+
+    return module_root
+
+
+ROOT_DIR = _discover_root_dir()
 GLSL_DIR = ROOT_DIR / "glsl"
 MP4_DIR = ROOT_DIR / "mp4"
 
@@ -76,4 +130,3 @@ def read_fallback_assets() -> Dict[str, List[dict]]:
         "videos": _read_mp4_assets(),
         "overlays": [],
     }
-

@@ -17,6 +17,10 @@ dist-ssr
 app/ui/dist
 *.local
 
+# Python virtual environments
+.venv/
+.uv/
+
 # Python / caching
 __pycache__/
 *.py[cod]

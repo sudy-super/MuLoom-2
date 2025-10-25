@@ -112,10 +112,12 @@ const ViewerPage = () => {
 
   const {
     connectionState: rtcConnectionState,
+    autoplayBlocked: rtcAutoplayBlocked,
     initBroadcaster,
     handleRemoteAnswer,
     addRemoteIceCandidate,
     closeConnection,
+    retryAutoplay,
   } = useRTCStreaming(sendRTCSignal);
 
   const isStartingStreamRef = useRef(false);
@@ -180,7 +182,8 @@ const ViewerPage = () => {
     MIX_DECK_KEYS.forEach((deckKey) => {
       playManagedVideo(`viewer-${deckKey}`);
     });
-  }, [playManagedVideo]);
+    void retryAutoplay();
+  }, [playManagedVideo, retryAutoplay]);
 
   const handleUserTapKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLDivElement>) => {
@@ -774,6 +777,8 @@ const ViewerPage = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [toggleFullscreen]);
 
+  const shouldShowAutoplayOverlay = requiresUserTap || rtcAutoplayBlocked;
+
   return (
     <div className="app viewer-app">
       <canvas
@@ -786,7 +791,7 @@ const ViewerPage = () => {
       <div className="mix-layer-stack">
         {MIX_DECK_KEYS.map((key) => renderDeckLayer(key))}
       </div>
-      {requiresUserTap ? (
+      {shouldShowAutoplayOverlay ? (
         <div
           className="viewer-autoplay-overlay"
           role="button"

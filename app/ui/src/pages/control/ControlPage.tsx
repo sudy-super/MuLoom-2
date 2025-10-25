@@ -568,12 +568,20 @@ const ControlPage = () => {
       if (!value) {
         sendDeckUpdate(deck, { type: null, assetId: null, opacity: 0 });
         requestDeckSource(deck, null);
+        setDeckStates((previous) => ({
+          ...previous,
+          [deck]: { ...previous[deck], src: null, isLoading: false, progress: 0 },
+        }));
         return;
       }
 
       if (value === 'generative') {
         sendDeckUpdate(deck, { type: 'generative', assetId: null, opacity: 1 });
         requestDeckSource(deck, null);
+        setDeckStates((previous) => ({
+          ...previous,
+          [deck]: { ...previous[deck], src: null, isLoading: false, progress: 0 },
+        }));
         return;
       }
 
@@ -581,21 +589,58 @@ const ControlPage = () => {
       if (type === 'glsl' && assetId) {
         sendDeckUpdate(deck, { type: 'shader', assetId, opacity: 1 });
         requestDeckSource(deck, null);
+        setDeckStates((previous) => ({
+          ...previous,
+          [deck]: { ...previous[deck], src: null, isLoading: false, progress: 0 },
+        }));
         return;
       }
 
       if (type === 'video' && assetId) {
-        sendDeckUpdate(deck, { type: 'video', assetId, opacity: 1 });
+        const currentDeck = decks[deck];
+        const previousDeckState = deckStates[deck];
+        const updatePayload: Partial<MixDeck> = {
+          type: 'video',
+          assetId,
+        };
+        if (currentDeck?.type !== 'video' || currentDeck.opacity == null) {
+          updatePayload.opacity = 1;
+        }
         const video =
           assets.videos.find((item) => item.id === assetId) ??
           assets.overlays?.find((item) => item.id === assetId);
         const url =
           video && 'url' in video && typeof video.url === 'string' ? video.url : null;
+        if (!url) {
+          console.warn(`Deck ${deck}: missing URL for asset '${assetId}'`);
+          return;
+        }
+        sendDeckUpdate(deck, updatePayload);
+        setDeckStates((previous) => ({
+          ...previous,
+          [deck]: {
+            ...previous[deck],
+            src: url,
+            isLoading: true,
+            progress: 0,
+            error: false,
+          },
+        }));
         requestDeckSource(deck, url);
+        requestDeckSeek(deck, 0, { resume: previousDeckState?.isPlaying ?? false });
         return;
       }
     },
-    [assets.overlays, assets.videos, requestDeckSource, sendDeckUpdate],
+    [
+      assets.overlays,
+      assets.videos,
+      deckStates,
+      decks,
+      requestDeckSeek,
+      requestDeckSource,
+      sendDeckUpdate,
+      setDeckStates,
+    ],
   );
 
   const handleDeckOpacitySliderChange = useCallback(

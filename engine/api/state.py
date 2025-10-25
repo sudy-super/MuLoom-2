@@ -358,6 +358,7 @@ class EngineState:
             "deckMediaStates": {
                 key: state.to_dict() for key, state in self.deck_media_states.items()
             },
+            "pipeline": self.pipeline.describe(),
         }
 
     def rebuild_mixer_layers(self) -> None:

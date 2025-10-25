@@ -1,5 +1,5 @@
 """
-Placeholder WebRTC session management.
+Minimal in-memory WebRTC session representation.
 """
 
 from __future__ import annotations
@@ -10,6 +10,8 @@ from typing import List, Optional
 
 @dataclass
 class ICECandidate:
+    """Serialisable ICE candidate container."""
+
     candidate: str
     sdp_mid: Optional[str] = None
     sdp_mline_index: Optional[int] = None
@@ -17,7 +19,13 @@ class ICECandidate:
 
 @dataclass
 class WebRTCSession:
-    """In-memory representation of a WebRTC session."""
+    """
+    Tracks the negotiate artefacts exchanged with the control UI.
+
+    The webrtcsink element already embeds its own signaller; this class simply
+    keeps the latest offer/answer/candidates so the REST layer can expose them
+    for debugging when necessary.
+    """
 
     offer: Optional[str] = None
     answer: Optional[str] = None
@@ -32,3 +40,5 @@ class WebRTCSession:
     def add_candidate(self, candidate: ICECandidate) -> None:
         self.ice_candidates.append(candidate)
 
+
+__all__ = ["ICECandidate", "WebRTCSession"]
