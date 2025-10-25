@@ -37,14 +37,19 @@ export class VideoMediaManager {
   private errorRecoveryAttempts = 0;
   private static readonly MAX_ERROR_RECOVERY_ATTEMPTS = 3;
   private static readonly FALLBACK_SYNC_INTERVAL_MS = 100;
-  private static readonly PLAYBACK_RATE_STEP = 0.25;
+  private static readonly SAFE_RATE_DEBOUNCE_MS = 150;
+  private static readonly PLAYBACK_RATE_MIN = 0;
+  private static readonly PLAYBACK_RATE_MAX = 5.0;
+  private static readonly MICRO_SEEK_OFFSET = 0.0001;
   private targetPlaybackRate = 1.0;
   private playbackRateRaf: number | null = null;
+  private pendingPlaybackRate: number | null = null;
+  private playbackRateTimer: number | null = null;
+  private decodeErrorCount = 0;
   private surfaces: Map<SurfaceId, SurfaceDescriptor> = new Map();
   private primarySurfaceId: SurfaceId | null = null;
   private captureUnavailable = false;
   private fallbackSyncHandle: number | null = null;
-  private static readonly FALLBACK_SYNC_INTERVAL_MS = 100;
 
   registerSurface(surfaceId: SurfaceId, element: HTMLDivElement | null, options?: { primary?: boolean }) {
     let surface = this.surfaces.get(surfaceId);
@@ -380,7 +385,6 @@ export class VideoMediaManager {
     }
 
     const targetTime = primary.currentTime;
-    const shouldPlay = !primary.paused;
     const playbackRate = primary.playbackRate || 1;
     const targetPaused = primary.paused;
 
@@ -568,20 +572,187 @@ export class VideoMediaManager {
     }
   }
 
+  private queueSafePlaybackRate(rate: number) {
+    this.pendingPlaybackRate = rate;
+
+    const video = this.videoElement;
+    if (!video || video.srcObject) {
+      return;
+    }
+
+    if (this.playbackRateTimer !== null) {
+      window.clearTimeout(this.playbackRateTimer);
+    }
+
+    this.playbackRateTimer = window.setTimeout(() => {
+      this.playbackRateTimer = null;
+      this.applyPendingPlaybackRate();
+    }, VideoMediaManager.SAFE_RATE_DEBOUNCE_MS);
+  }
+
+  private applyPendingPlaybackRate() {
+    if (this.playbackRateTimer !== null) {
+      window.clearTimeout(this.playbackRateTimer);
+      this.playbackRateTimer = null;
+    }
+
+    const video = this.videoElement;
+    const rate = this.pendingPlaybackRate;
+    if (!video || rate == null) {
+      return;
+    }
+
+    this.pendingPlaybackRate = null;
+
+    if (rate <= 0.0001) {
+      this.playbackRate = rate;
+      this.targetPlaybackRate = rate;
+      return;
+    }
+
+    if (video.srcObject) {
+      this.targetPlaybackRate = this.playbackRate;
+      return;
+    }
+
+    const targetRate = Math.max(
+      VideoMediaManager.PLAYBACK_RATE_MIN,
+      Math.min(VideoMediaManager.PLAYBACK_RATE_MAX, rate),
+    );
+
+    const applyWithFallback = () => {
+      const wasPaused = video.paused;
+      const shouldResume = this.pendingPlay || !wasPaused;
+
+      const updateStateAndMirrors = () => {
+        const actualRate = video.playbackRate;
+        this.playbackRate = actualRate;
+        if (Math.abs(actualRate - targetRate) <= 0.001) {
+          this.targetPlaybackRate = targetRate;
+        } else {
+          console.warn(
+            '[Video] playbackRate mismatch after apply',
+            { requested: targetRate, actual: actualRate },
+          );
+          this.targetPlaybackRate = actualRate;
+        }
+        this.refreshMirrorSurfaces();
+
+        if (shouldResume && video.paused) {
+          const playPromise = video.play();
+          if (playPromise && typeof playPromise.catch === 'function') {
+            playPromise.catch((error) => {
+              if (!this.isBenignPlayError(error)) {
+                console.warn('Video play after rate change failed', error);
+              }
+            });
+          }
+        }
+      };
+
+      const simpleApplied = (() => {
+        try {
+          video.playbackRate = targetRate;
+          return Math.abs(video.playbackRate - targetRate) <= 0.001;
+        } catch (error) {
+          console.warn('[Video] playbackRate apply failed, retrying with resync', error);
+          return false;
+        }
+      })();
+
+      if (simpleApplied) {
+        updateStateAndMirrors();
+        return;
+      }
+
+      const currentTime = Number.isFinite(video.currentTime) ? video.currentTime : null;
+
+      try {
+        if (!wasPaused) {
+          try {
+            video.pause();
+          } catch (error) {
+            console.warn('[Video] pause during rate resync failed', error);
+          }
+        }
+
+        try {
+          video.playbackRate = 1.0;
+        } catch {
+          // ignore reset errors
+        }
+
+        if (currentTime !== null) {
+          try {
+            const fallbackTime = Math.max(0, currentTime - VideoMediaManager.MICRO_SEEK_OFFSET);
+            if (fallbackTime !== currentTime) {
+              video.currentTime = fallbackTime;
+            }
+            video.currentTime = currentTime;
+          } catch (error) {
+            console.warn('[Video] currentTime restore during rate resync failed', error);
+          }
+        }
+
+        video.playbackRate = targetRate;
+      } catch (error) {
+        console.error('[Video] playbackRate apply failed after resync attempt', error);
+      }
+
+      updateStateAndMirrors();
+    };
+
+    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      const onLoadedData = () => {
+        video.removeEventListener('loadeddata', onLoadedData);
+        applyWithFallback();
+      };
+      video.addEventListener('loadeddata', onLoadedData, { once: true });
+      return;
+    }
+
+    applyWithFallback();
+  }
+
   setPlaybackRate(rate: number) {
-    const clampedRate = Math.max(0, Math.min(5, rate));
+    if (rate <= 0.0001) {
+      if (this.state === 'playing') {
+        this.pause();
+      } else {
+        this.pendingPlay = false;
+        this.setState('paused');
+      }
+      this.targetPlaybackRate = 0;
+      this.playbackRate = 0;
+      this.pendingPlaybackRate = null;
+      if (this.playbackRateTimer !== null) {
+        window.clearTimeout(this.playbackRateTimer);
+        this.playbackRateTimer = null;
+      }
+      return 0;
+    }
+
+    const clampedRate = Math.max(
+      VideoMediaManager.PLAYBACK_RATE_MIN,
+      Math.min(VideoMediaManager.PLAYBACK_RATE_MAX, rate),
+    );
     this.targetPlaybackRate = clampedRate;
+
     if (!this.videoElement) {
+      this.pendingPlaybackRate = clampedRate;
       this.playbackRate = clampedRate;
       return clampedRate;
     }
-    if (this.playbackRateRaf === null) {
-      this.schedulePlaybackRateUpdate();
+
+    if (this.videoElement.srcObject) {
+      console.warn('[Video] playbackRate ignored for MediaStream srcObject');
+      this.targetPlaybackRate = this.playbackRate;
+      return this.playbackRate;
     }
 
-    if (clampedRate <= 0.0001 && this.state === 'playing') {
-      this.pause();
-    } else if (this.pendingPlay && this.state === 'paused') {
+    this.queueSafePlaybackRate(clampedRate);
+
+    if (this.pendingPlay && this.state === 'paused') {
       this.play();
     }
 
@@ -662,6 +833,11 @@ export class VideoMediaManager {
       window.cancelAnimationFrame(this.playbackRateRaf);
       this.playbackRateRaf = null;
     }
+    if (this.playbackRateTimer !== null) {
+      window.clearTimeout(this.playbackRateTimer);
+      this.playbackRateTimer = null;
+    }
+    this.pendingPlaybackRate = null;
   }
 
   getState() {
@@ -710,6 +886,11 @@ export class VideoMediaManager {
       window.cancelAnimationFrame(this.playbackRateRaf);
       this.playbackRateRaf = null;
     }
+    if (this.playbackRateTimer !== null) {
+      window.clearTimeout(this.playbackRateTimer);
+      this.playbackRateTimer = null;
+    }
+    this.pendingPlaybackRate = null;
   }
 
   private async cleanupPreparedVideo() {
@@ -906,12 +1087,28 @@ export class VideoMediaManager {
   }
 
   private applyPlaybackRate(rate: number) {
-    if (!this.videoElement) {
+    const video = this.videoElement;
+    if (!video) {
       return;
     }
 
+    if (rate <= 0.0001) {
+      this.playbackRate = rate;
+      return;
+    }
+
+    if (video.srcObject) {
+      return;
+    }
+
+    const safeRate = Math.max(
+      VideoMediaManager.PLAYBACK_RATE_MIN,
+      Math.min(VideoMediaManager.PLAYBACK_RATE_MAX, rate),
+    );
+
     try {
-      this.videoElement.playbackRate = rate <= 0.0001 ? 0.0001 : rate;
+      video.playbackRate = safeRate;
+      this.playbackRate = safeRate;
     } catch {
       // ignore playback rate errors
     }
@@ -921,28 +1118,21 @@ export class VideoMediaManager {
     if (this.playbackRateRaf !== null) {
       return;
     }
-    const stepUpdate = () => {
-      if (!this.videoElement) {
-        this.playbackRateRaf = null;
-        this.playbackRate = this.targetPlaybackRate;
+    this.playbackRateRaf = window.requestAnimationFrame(() => {
+      this.playbackRateRaf = null;
+
+      const desiredRate = this.pendingPlaybackRate ?? this.targetPlaybackRate;
+      if (desiredRate == null || desiredRate <= 0.0001) {
+        this.playbackRate = desiredRate ?? this.playbackRate;
         return;
       }
-      const current = this.videoElement.playbackRate;
-      const target = this.targetPlaybackRate;
-      const diff = target - current;
-      if (Math.abs(diff) <= 0.01) {
-        this.applyPlaybackRate(target);
-        this.playbackRate = target;
-        this.playbackRateRaf = null;
+
+      if (!this.videoElement || this.videoElement.srcObject) {
         return;
       }
-      const step = Math.sign(diff) * Math.min(Math.abs(diff), VideoMediaManager.PLAYBACK_RATE_STEP);
-      const next = current + step;
-      this.applyPlaybackRate(next);
-      this.playbackRate = next;
-      this.playbackRateRaf = window.requestAnimationFrame(stepUpdate);
-    };
-    this.playbackRateRaf = window.requestAnimationFrame(stepUpdate);
+
+      this.queueSafePlaybackRate(desiredRate);
+    });
   }
 
   private attemptPlayback() {
@@ -1156,8 +1346,13 @@ export class VideoMediaManager {
     }
 
     const mediaError = video.error;
-    let errorMessage = 'Unknown video error';
+    if (mediaError?.code === MediaError.MEDIA_ERR_DECODE) {
+      console.warn('[Video] MEDIA_ERR_DECODE detected -> soft recovery');
+      this.recoverFromDecodeError();
+      return;
+    }
 
+    let errorMessage = 'Unknown video error';
     if (mediaError) {
       const maybeMessage = (mediaError as MediaError & { message?: string }).message;
       errorMessage =
@@ -1208,6 +1403,139 @@ export class VideoMediaManager {
       });
     }, Math.min(2000, 300 * attemptNumber));
   };
+
+  private recoverFromDecodeError() {
+    const video = this.videoElement;
+    if (!video) {
+      return;
+    }
+
+    if (video.srcObject) {
+      console.warn('[Video] Decode recovery skipped for MediaStream source');
+      return;
+    }
+
+    const resolvedSrc =
+      video.currentSrc ||
+      video.src ||
+      (this.currentSrc ? this.buildCacheBustedUrl(this.currentSrc, this.loadToken) : null);
+    if (!resolvedSrc) {
+      console.warn('[Video] Decode recovery aborted: missing media source');
+      return;
+    }
+
+    const resumePlayback = this.pendingPlay || !video.paused;
+    const snapshotTime = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    const snapshotVolume = Number.isFinite(video.volume) ? video.volume : 1;
+    const wasMuted = video.muted;
+    const desiredRate =
+      this.targetPlaybackRate > 0.0001
+        ? this.targetPlaybackRate
+        : this.playbackRate > 0.0001
+          ? this.playbackRate
+          : 1.0;
+
+    this.decodeErrorCount += 1;
+    const enforceNormalRate = this.decodeErrorCount >= 2;
+    const rateToRestore = enforceNormalRate
+      ? 1.0
+      : Math.max(
+          VideoMediaManager.PLAYBACK_RATE_MIN,
+          Math.min(VideoMediaManager.PLAYBACK_RATE_MAX, desiredRate),
+        );
+    if (enforceNormalRate) {
+      console.warn('[Video] repeated decode error -> reset playback rate to 1.0');
+      this.decodeErrorCount = 0;
+    }
+
+    this.pendingPlaybackRate = null;
+    if (this.playbackRateTimer !== null) {
+      window.clearTimeout(this.playbackRateTimer);
+      this.playbackRateTimer = null;
+    }
+
+    try {
+      video.pause();
+    } catch {
+      // ignore pause errors
+    }
+
+    try {
+      video.src = '';
+      video.load();
+      video.src = resolvedSrc;
+      video.load();
+    } catch (error) {
+      console.error('[Video] Failed to reload media source after decode error', error);
+      return;
+    }
+
+    video.muted = true;
+    this.pendingPlay = resumePlayback;
+
+    let metadataTimer: number | null = null;
+    const handleLoadedMetadata = () => {
+      if (metadataTimer !== null) {
+        window.clearTimeout(metadataTimer);
+        metadataTimer = null;
+      }
+      video.removeEventListener('loadedmetadata', handleLoadedMetadata);
+
+      if (Number.isFinite(snapshotTime)) {
+        try {
+          const fallbackTime = Math.max(0, snapshotTime - VideoMediaManager.MICRO_SEEK_OFFSET);
+          if (fallbackTime !== snapshotTime) {
+            video.currentTime = fallbackTime;
+          }
+          video.currentTime = snapshotTime;
+        } catch (error) {
+          console.warn('[Video] currentTime restore during decode recovery failed', error);
+        }
+      }
+
+      video.volume = snapshotVolume;
+
+      this.pendingPlaybackRate = rateToRestore;
+      this.targetPlaybackRate = rateToRestore;
+      this.applyPendingPlaybackRate();
+
+      const restoreMuteAndVolume = () => {
+        video.muted = wasMuted;
+        video.volume = snapshotVolume;
+      };
+
+      if (resumePlayback) {
+        let restoreTimer: number | null = null;
+        const onPlaying = () => {
+          if (restoreTimer !== null) {
+            window.clearTimeout(restoreTimer);
+          }
+          restoreMuteAndVolume();
+        };
+        restoreTimer = window.setTimeout(() => {
+          video.removeEventListener('playing', onPlaying);
+          restoreMuteAndVolume();
+        }, 1500);
+        video.addEventListener('playing', onPlaying, { once: true });
+      } else {
+        restoreMuteAndVolume();
+      }
+
+      this.refreshMirrorSurfaces();
+      this.errorRecoveryAttempts = 0;
+      this.decodeErrorCount = 0;
+    };
+
+    if (video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+      handleLoadedMetadata();
+    } else {
+      metadataTimer = window.setTimeout(() => {
+        console.warn('[Video] decode recovery continuing without loadedmetadata event');
+        handleLoadedMetadata();
+      }, 3000);
+      video.addEventListener('loadedmetadata', handleLoadedMetadata, { once: true });
+    }
+  }
 
   private handleEnded = (event: Event) => {
     const video = event.target as HTMLVideoElement;
