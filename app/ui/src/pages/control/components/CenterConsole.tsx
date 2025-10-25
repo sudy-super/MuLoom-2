@@ -16,7 +16,7 @@ type CenterConsoleProps = {
   onLoadDeck: (deckKey: DeckKey) => void;
   crossfaderValue: number;
   onCrossfaderChange: (value: number) => void;
-  masterPreviewRefs: Record<DeckKey, (element: HTMLVideoElement | null) => void>;
+  masterPreviewRefs: Record<DeckKey, (element: HTMLDivElement | null) => void>;
   rtcSignal: RTCSignalMessage | null;
   onSendRTCSignal: (signal: RTCSignalMessage) => void;
   onConsumeRTCSignal: () => void;
@@ -27,7 +27,7 @@ const renderMasterPreviewLayer = (
   decks: Record<DeckKey, MixDeck>,
   deckMixOutputs: Record<DeckKey, number>,
   assets: FallbackAssets,
-  masterPreviewRefs: Record<DeckKey, (element: HTMLVideoElement | null) => void>,
+  masterPreviewRefs: Record<DeckKey, (element: HTMLDivElement | null) => void>,
 ) => {
   const deck = decks[deckKey];
   const effectiveOpacity = Math.max(0, Math.min(1, deckMixOutputs[deckKey] ?? 0));
@@ -52,12 +52,9 @@ const renderMasterPreviewLayer = (
     }
     const videoKey = `master-mix-${deckKey}-${video.id}`;
     return (
-      <video
+      <div
         key={videoKey}
         className="master-preview-layer"
-        muted
-        playsInline
-        preload="auto"
         ref={masterPreviewRefs[deckKey]}
         style={commonStyle}
       />

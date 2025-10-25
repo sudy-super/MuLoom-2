@@ -16,7 +16,6 @@ __all__ = [
     "SourceFactory",
     "OutputFactory",
     "CodecCapabilities",
-    "PanicSwitch",
 ]
 
 from .mixers import MixerBuilder
@@ -25,5 +24,3 @@ from .isf_loader import ISFProgram
 from .sources import SourceFactory
 from .outputs import OutputFactory
 from .codecs import CodecCapabilities
-from .panic import PanicSwitch
-

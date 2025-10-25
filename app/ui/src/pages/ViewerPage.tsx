@@ -91,7 +91,7 @@ const ViewerPage = () => {
   });
 
   const {
-    registerVideo: registerManagedVideo,
+    registerContainer: registerManagedContainer,
     loadSource: loadManagedSource,
     play: playManagedVideo,
     pause: pauseManagedVideo,
@@ -152,12 +152,12 @@ const ViewerPage = () => {
   const viewerVideoRefCallbacks = useMemo(
     () =>
       MIX_DECK_KEYS.reduce((accumulator, key) => {
-        accumulator[key] = (element: HTMLVideoElement | null) => {
-          registerManagedVideo(`viewer-${key}`, element);
+        accumulator[key] = (element: HTMLDivElement | null) => {
+          registerManagedContainer(`viewer-${key}`, element);
         };
         return accumulator;
-      }, {} as Record<DeckKey, (element: HTMLVideoElement | null) => void>),
-    [registerManagedVideo],
+      }, {} as Record<DeckKey, (element: HTMLDivElement | null) => void>),
+    [registerManagedContainer],
   );
 
   const resolveDeckAssetSrc = useCallback(
@@ -758,7 +758,7 @@ const ViewerPage = () => {
           opacity={effectiveOpacity}
           blendMode={blendMode}
           mediaState={deckMediaStates?.[deckKey]}
-          registerVideo={viewerVideoRefCallbacks[deckKey]}
+          registerContainer={viewerVideoRefCallbacks[deckKey]}
         />
       );
     }

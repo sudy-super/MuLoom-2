@@ -20,10 +20,10 @@ export function useVideoMedia() {
     return managersRef.current[key];
   }, []);
 
-  const registerVideo = useCallback(
-    (key: string, element: HTMLVideoElement | null) => {
+  const registerContainer = useCallback(
+    (key: string, element: HTMLDivElement | null) => {
       const manager = getManager(key);
-      manager.registerVideoElement(element);
+      manager.registerContainer(element);
     },
     [getManager],
   );
@@ -32,6 +32,14 @@ export function useVideoMedia() {
     (key: string, src: string | null): Promise<boolean> => {
       const manager = getManager(key);
       return manager.loadSource(src);
+    },
+    [getManager],
+  );
+
+  const prepare = useCallback(
+    (key: string, source: string | MediaStream) => {
+      const manager = getManager(key);
+      return manager.prepare(source);
     },
     [getManager],
   );
@@ -89,8 +97,9 @@ export function useVideoMedia() {
   );
 
   return {
-    registerVideo,
+    registerContainer,
     loadSource,
+    prepare,
     play,
     pause,
     seekToPercent,

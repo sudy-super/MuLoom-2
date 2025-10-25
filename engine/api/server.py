@@ -184,7 +184,7 @@ class RealtimeManager:
             deck = payload.get("deck")
             state_payload = payload.get("state") or {}
             if deck:
-                did_change = self.state.update_deck_media_state(deck, state_payload)
+                did_change, revision = self.state.update_deck_media_state(deck, state_payload)
                 state = self.state.deck_media_states.get(deck)
                 if state:
                     message_payload = {
@@ -192,6 +192,7 @@ class RealtimeManager:
                         "payload": {
                             "deck": deck,
                             "state": state.to_dict(),
+                            "revision": revision,
                         },
                     }
                     if did_change:
@@ -326,19 +327,6 @@ def create_app(
         refresh_mixer_layers()
         await realtime.broadcast_mix_state()
         return {"ok": True}
-
-    @app.post("/panic")
-    async def trigger_panic(payload: schemas.PanicRequest) -> dict:
-        engine_state.panic = payload.on
-        engine_state.panic_card = payload.card
-        await realtime.broadcast(
-            {"type": "panic", "payload": {"on": engine_state.panic, "card": engine_state.panic_card}}
-        )
-        return {"ok": True, "panic": engine_state.panic}
-
-    @app.get("/panic")
-    async def get_panic() -> dict:
-        return {"on": engine_state.panic, "card": engine_state.panic_card}
 
     @app.post("/ndi/in")
     async def attach_ndi_input(payload: schemas.NDIInputRequest) -> dict:

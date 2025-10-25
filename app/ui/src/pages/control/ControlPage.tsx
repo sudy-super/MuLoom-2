@@ -36,7 +36,7 @@ const createDefaultDeckMediaState = (): Record<DeckKey, DeckMediaState> => ({
 
 const ControlPage = () => {
   const {
-    registerVideo,
+    registerContainer,
     loadSource,
     play: playVideo,
     pause: pauseVideo,
@@ -128,23 +128,23 @@ const ControlPage = () => {
   const deckVideoRefCallbacks = useMemo(
     () =>
       deckKeys.reduce((accumulator, key) => {
-        accumulator[key] = (element: HTMLVideoElement | null) => {
-          registerVideo(`deck-${key}`, element);
+        accumulator[key] = (element: HTMLDivElement | null) => {
+          registerContainer(`deck-${key}`, element);
         };
         return accumulator;
-      }, {} as Record<DeckKey, (element: HTMLVideoElement | null) => void>),
-    [registerVideo],
+      }, {} as Record<DeckKey, (element: HTMLDivElement | null) => void>),
+    [registerContainer],
   );
 
   const masterPreviewVideoRefCallbacks = useMemo(
     () =>
       deckKeys.reduce((accumulator, key) => {
-        accumulator[key] = (element: HTMLVideoElement | null) => {
-          registerVideo(`master-${key}`, element);
+        accumulator[key] = (element: HTMLDivElement | null) => {
+          registerContainer(`master-${key}`, element);
         };
         return accumulator;
-      }, {} as Record<DeckKey, (element: HTMLVideoElement | null) => void>),
-    [registerVideo],
+      }, {} as Record<DeckKey, (element: HTMLDivElement | null) => void>),
+    [registerContainer],
   );
 
   const deckDurationsRef = useRef<Record<DeckKey, number>>({
@@ -839,19 +839,15 @@ const ControlPage = () => {
           (typeof deckState.src === 'string' && deckState.src.length > 0 ? deckState.src : undefined) ||
           (typeof video.url === 'string' && video.url.length > 0 ? video.url : undefined);
         return (
-          <video
+          <div
             key={videoKey}
-            src={resolvedSrc}
-            muted
-            loop
-            playsInline
-            preload="auto"
             className="deck-preview-video"
             ref={deckVideoRefCallbacks[deckKey]}
             style={{
               opacity: effectiveOpacity,
               filter: deckState.isLoading ? 'brightness(0.5)' : 'none',
             }}
+            data-video-src={resolvedSrc ?? undefined}
           />
         );
       }

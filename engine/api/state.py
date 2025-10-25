@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 import time
 
 from ..graph.mixers import MixerLayer
@@ -152,6 +152,7 @@ class DeckMediaState:
     is_loading: bool = False
     error: bool = False
     duration: float | None = None
+    last_load_revision: int = 0
     _updated_at_monotonic: float = field(default_factory=time.monotonic, repr=False)
 
     def _normalise_src(self, value) -> str | None:
@@ -333,6 +334,7 @@ class DeckMediaState:
             "isLoading": bool(self.is_loading),
             "error": bool(self.error),
             "duration": self.duration,
+            "loadRevision": int(self.last_load_revision),
         }
 
 
@@ -344,8 +346,6 @@ class EngineState:
 
     pipeline: Pipeline = field(default_factory=Pipeline)
     mix: MixState = field(default_factory=MixState)
-    panic: bool = False
-    panic_card: str = "black"
     active_profile: str = "default"
     control_settings: ControlSettings = field(default_factory=ControlSettings)
     viewer_status: ViewerStatus = field(default_factory=ViewerStatus)
@@ -403,10 +403,10 @@ class EngineState:
         setattr(self.mix, field_name, value)
         return True
 
-    def update_deck_media_state(self, deck_key: str, payload: dict) -> bool:
+    def update_deck_media_state(self, deck_key: str, payload: dict) -> Tuple[bool, Optional[int]]:
         state = self.deck_media_states.get(deck_key)
         if not state:
-            return False
+            return False, None
 
         previous_src = state.src
         reload_requested = False
@@ -422,14 +422,17 @@ class EngineState:
                 reload_requested = True
 
         changed = state.apply_request(state_payload)
+        revision: Optional[int] = None
 
         if changed and (previous_src != state.src or reload_requested):
             try:
-                self.pipeline.set_deck_source(deck_key, state.src)
+                revision = self.pipeline.set_deck_source(deck_key, state.src)
+                if revision is not None:
+                    state.last_load_revision = revision
             except Exception:  # pragma: no cover - defensive
                 LOG.exception("Failed to update pipeline source for deck '%s'", deck_key)
 
-        return changed
+        return changed, revision
 
     def mixer_layers(self) -> Dict[str, MixerLayer]:
         layers = {}

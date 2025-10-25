@@ -19,6 +19,7 @@ from typing import AsyncIterator, Optional
 from . import EngineConfig
 from .api.state import EngineState
 from .api.server import create_app
+from .runtime.gst_adapter import GStreamerPipelineAdapter
 from .utils.logging import configure_logging
 
 LOG = logging.getLogger(__name__)
@@ -55,12 +56,24 @@ async def serve(config: EngineConfig, host: str = "127.0.0.1", port: int = 8080)
     import uvicorn
 
     engine_state = EngineState()
+    gst_adapter = GStreamerPipelineAdapter(engine_state.pipeline)
     configure_logging()
 
     @asynccontextmanager
     async def app_lifespan(_app) -> AsyncIterator[None]:
-        async with lifespan(engine_state):
-            yield
+        try:
+            gst_adapter.start()
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Failed to start GStreamer adapter; continuing without it.")
+
+        try:
+            async with lifespan(engine_state):
+                yield
+        finally:
+            try:
+                gst_adapter.stop()
+            except Exception:  # pragma: no cover - defensive
+                LOG.exception("Failed to stop GStreamer adapter cleanly.")
 
     app = create_app(state=engine_state, config=config, lifespan=app_lifespan)
     server_config = uvicorn.Config(

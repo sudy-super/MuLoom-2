@@ -1,29 +1,31 @@
 # MuLoom バックエンド作業ログ
 
 ## 計画
-- [x] パイプラインの開始／停止フローを強化し、雑な操作でもクラッシュせずフォールバックするようにする。
-- [x] 共有状態スナップショットに `last_error` を含め、パイプラインの状態を可視化する。
-- [ ] プレースホルダー処理を拡張し、他のソース／出力種別にも対応させる。
-- [ ] プレースホルダーとステータス報告を検証する自動テストを追加する。
+- [x] パイプライン制御を「状態ストア」として再構築し、GStreamer 依存を分離する。
+- [x] 共有状態スナップショット経由で UI が必要とする情報を引き続き公開する。
+- [x] 専用のメディア実行アダプタ（GStreamer など）を新設し、状態ストアの差分適用を実装する。
+- [ ] 状態ストアとアダプタ間のプロトコルを自動テストで検証する。
 
 ## 進捗（2025-10-25）
-- `engine/pipeline.Pipeline` を改修し、GStreamer が未導入の場合や未サポートのソース・無効な URI が指定された場合でも `videotestsrc` へのフォールバックと `last_error` 記録で安全に処理できるようにした。
-- `EngineState.snapshot()` に `pipeline` 情報を追加し、UI 側でバックエンドの健全性を確認できるようにした。
-- `python -m compileall engine/pipeline.py` でモジュールがコンパイル可能であることを確認した。
+- `engine/pipeline.Pipeline` を全面的に書き換え、メディア実行は外部アダプタへ委譲しつつデッキや出力の宣言的な状態のみを管理するようにした。
+- `EngineState.snapshot()` による API レスポンス構造を維持しながら、デッキやミキサー情報を依存レスで生成できるよう整理した。
+- `pytest` をプロジェクト直下で実行できるように `tests/conftest.py` を追加し、最小限のユニットテストを通ることを確認した。
+- `engine/runtime/gst_adapter.GStreamerPipelineAdapter` を導入し、Pipeline の差分を GStreamer が利用可能な環境で実パイプラインへ反映させる土台を用意した（非対応環境では安全に無効化）。
 
 ## 仕様メモ
-- `Pipeline.describe()` がグラフ情報に加えて `last_error` を返すようになり、診断が容易になった。
-- `Pipeline.start()` はパイプラインを構築できない理由を記録しつつ安全にリトライ可能な状態を保つ。
-- ファイルソースはエラー発生時に自動でプレースホルダーへ切り替わり、ミキサーのアルファを 0 のまま保持して表示崩れを防ぐ。
-- プレースホルダーの映像枝は `videotestsrc → videoconvert → glupload → queue` で構成し、利用できない要素はログを残してスキップする。
-- `EngineState.snapshot()` がパイプライン状態を API/UI へ公開する。
+- `Pipeline.describe()` は宣言的なグラフ（ソース・出力・シェーダ・ミックス）とデッキごとの状態を返す。GStreamer の有無に関わらず一定のレスポンスが得られる。
+- `Pipeline.start()` / `stop()` は単にフラグを切り替える。実際のメディア開始処理は専用アダプタが担当する想定。
+- `Pipeline.set_deck_source()` は URI の正規化とリビジョン番号の更新のみを行い、結果は `describe()` の `decks` に即座に反映される。
+- シェーダ設定は `ShaderChain` に `ShaderPass` を差し込みつつ、もとの文字列リストも保持するシンプルな構造にした。
+- GStreamer アダプタは `playbin` + `fakesink` による簡易再生パイプラインで差分を適用し、将来的な高度化のためのホットスワップ基盤を提供する。
 
 ## 次のステップ
-- 必要に応じて API 経由でミキサー／出力の追加メトリクスを公開する。
-- `last_error` とプレースホルダー配線を検証するユニットテストを整備する。
+- NDI / WebRTC / 録画出力など追加シンクに対応した GStreamer ブランチを段階的に実装する。
+- GStreamer を有効化した CI もしくはローカルスモークテストの自動化を検討する。
 
 ## 検証
-- `python -m compileall engine/pipeline.py`
+- `pytest`
+- GStreamer 環境が整っている場合は `python scripts/demo_gst_adapter.py --uri file:///path/to/video.mp4` を実行し、プログラム出力（自動で `autovideosink` に表示）とプレビュー出力が動作することを目視確認する。
 
 ---
 
@@ -89,9 +91,9 @@ Tauri ビルドへ拡張するための雛形を用意しています。
 python -m engine.main --host 0.0.0.0 --port 8080
 ```
 
-起動すると、アセット列挙やデッキ制御、パニックカード、NDI 入出力などのエンドポイントがプレースホルダーとして
-利用可能になります。現時点ではインメモリ状態のみを操作しますが、後続タスクで GStreamer の実配線や
-WebSocket 連携を追加していく想定です。
+起動すると、アセット列挙やデッキ制御、NDI 入出力などのエンドポイントがプレースホルダーとして
+利用可能になります。現時点では宣言的な状態ストアが動作し、GStreamer が導入されている環境では
+実行アダプタが自動的にシンプルな再生パイプラインを構築します。
 
 ## フロントエンドと同時に開発する場合
 
@@ -108,3 +110,15 @@ Rust toolchain と `@tauri-apps/cli` を導入した上で `app/src-tauri/tauri.
 `npm run tauri:dev`（開発） / `npm run tauri:build`（ビルド）でデスクトップアプリを起動できます。
 Tauri 開発モードでは `scripts/dev_run.sh` が呼ばれ、FastAPI エンジンと Vite が同時に起動するため
 `glsl/` や `mp4/` 配下のアセットもブラウザ版と同様に利用できます。
+
+## GStreamer 実行アダプタの手動検証
+
+ローカルに GStreamer が導入されている場合、以下のスクリプトでエンジン単体の再生確認ができます。
+
+```bash
+python scripts/demo_gst_adapter.py --uri file:///absolute/path/to/video.mp4
+```
+
+- 複数の `--uri` を並べるとデッキ a/b/c/d に順番に割り当てられます。
+- サンプルパターンで試す場合は `--generator smpte` などを指定してください。
+- プログラム出力は `autovideosink` に表示され、プレビュー枝は `fakesink` に流れます（ログのみ）。

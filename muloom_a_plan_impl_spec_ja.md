@@ -79,6 +79,8 @@ muloom-a/
 │  ├─ rtc/
 │  │   ├─ webrtc.py             # webrtcbin の生成/SDP/ICE ハンドラ
 │  │   └─ preview_branch.py     # gldownload→vtenc_h264→webrtcbin
+│  ├─ runtime/
+│  │   └─ gst_adapter.py        # 状態ストア差分を GStreamer 実パイプラインへ反映
 │  ├─ audio/
 │  │   ├─ beat_aubio.py         # aubio で BPM/オンセット推定
 │  │   ├─ beat_essentia.py      # essentia 版（任意）
@@ -110,7 +112,8 @@ muloom-a/
 │  ├─ test_isf_loader.py
 │  ├─ test_panic.py
 │  ├─ test_codecs.py
-│  └─ test_rtc.py
+│  ├─ test_rtc.py
+│  └─ test_runtime_adapter.py
 │
 ├─ docs/
 │  └─ api-openapi.yaml          # REST/WS の仕様（OpenAPI）
@@ -128,9 +131,18 @@ muloom-a/
 - UI エンジンからの起動リクエストを受けて `pipeline.py` を構築。
 
 ### engine/pipeline.py
-- パイプライン生成の**オーケストレータ**。
-- `graph/` 配下のファクトリを用いて、**入力→GPU段（glupload→glshader*N→glvideomixer）→出力**を組み立てる。
-- `tee` でプレビュー枝を分岐、`rtc/preview_branch.py` に委譲。
+- GStreamer 実装に依存しない**宣言的な状態ストア**を提供。デッキ・ソース・出力・シェーダ・ミキサーをインメモリで保持する。
+- `describe()` で JSON シリアライズ可能なスナップショットを返し、外部アダプタが差分同期できるようにする。
+- 状態更新ごとにオブザーバへイベント通知を行い、URI 正規化やリビジョン番号管理を担う。
+
+### engine/runtime/gst_adapter.py
+- `Pipeline` のイベントを購読し、利用可能な場合は `uridecodebin` / `videotestsrc` → `compositor` → `tee` → `autovideosink` / `fakesink` で構成された実パイプラインを生成。
+- ミキサーレイヤ（アルファ）や出力設定を反映し、ステート更新ごとにパイプラインを再構築してホットスワップを実現。
+- GStreamer が未導入の環境では自動的に無効化され、ログのみを残すフェイルセーフ設計。
+
+### scripts/demo_gst_adapter.py
+- GStreamer アダプタを単体で起動し、ファイル URI やジェネレータパターンを簡易的に再生・確認するためのデモスクリプト。
+- `--uri` で指定した順にデッキ a/b/c/d へ割り当て。`--generator` で `videotestsrc` パターンを使用した検証が可能。
 
 ### engine/graph/shaders.py
 - `glshader` の生成・`fragment` 文字列の設定・`uniforms` の更新（GstStructure で一括）。
@@ -223,14 +235,12 @@ gst-launch-1.0 gltestsrc ! videoconvert !   vtenc_h264 realtime=true allow-frame
 - `POST /mix/crossfade`：`{{ value: 0.0..1.0 }}`
 - `POST /ndi/in`：`{{ sourceName }}` / `DELETE /ndi/in`
 - `POST /ndi/out`：`{{ publishName }}` / `DELETE /ndi/out`
-- `POST /panic`：`{{ on: true|false, card: "black"|"bars"|"image:…" }}`
 - `POST /prerender`：`{{ scene, codec:"hap|h264", params:[…] }}`
 
 ### WebSocket（抜粋）
 - `{{ "type":"uniform", "shader":1, "values":{{ "time":1.23, "gain":0.8 }} }}`
 - `{{ "type":"alpha", "pad":0, "value":0.75 }}`
 - `{{ "type":"beat", "bpm":128, "phase":0.31, "onset":true }}`（Engine→UI）
-- `{{ "type":"panic", "on":true }}`（相互）
 
 ---
 
@@ -296,12 +306,6 @@ class ISFProgram:
 
     @classmethod
     def load(cls, file_or_dir) -> "ISFProgram": ...
-
-# engine/graph/panic.py
-class PanicSwitch:
-    def __init__(self, pipeline): ...
-    def attach(self, video_pad) -> None: ...
-    def trigger(self, card: str = "black"): ...  # select input-selector pad
 ```
 
 ```python
@@ -330,15 +334,4 @@ paths:
               properties:
                 sourceName:
                   type: string
-  /panic:
-    post:
-      summary: Toggle panic card
-      requestBody:
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                on: {{"type": "boolean"}}
-                card: {{"type": "string", "enum": ["black", "bars", "logo"]}}
 ```

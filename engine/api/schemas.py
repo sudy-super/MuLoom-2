@@ -64,11 +64,6 @@ class ViewerStatusModel(BaseModel):
         return max(0.0, float(value))
 
 
-class PanicRequest(BaseModel):
-    on: bool
-    card: str = "black"
-
-
 class PrerenderRequest(BaseModel):
     scene: str
     codec: str

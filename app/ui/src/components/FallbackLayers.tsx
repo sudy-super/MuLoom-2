@@ -20,7 +20,7 @@ interface VideoLayerProps {
   opacity: number;
   blendMode?: BlendMode;
   mediaState?: DeckTimelineState;
-  registerVideo?: (element: HTMLVideoElement | null) => void;
+  registerContainer?: (element: HTMLDivElement | null) => void;
 }
 
 export function VideoFallbackLayer({
@@ -29,15 +29,15 @@ export function VideoFallbackLayer({
   opacity,
   blendMode,
   mediaState,
-  registerVideo,
+  registerContainer,
 }: VideoLayerProps) {
-  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const handleVideoRef = useCallback(
-    (element: HTMLVideoElement | null) => {
-      videoRef.current = element;
-      registerVideo?.(element);
+    (element: HTMLDivElement | null) => {
+      containerRef.current = element;
+      registerContainer?.(element);
     },
-    [registerVideo],
+    [registerContainer],
   );
   const mixBlend =
     blendMode && (blendModeMap[blendMode] ?? (blendMode as CSSProperties['mixBlendMode']));
@@ -45,7 +45,8 @@ export function VideoFallbackLayer({
   const shouldPlay = opacity > 0.001 && (mediaState ? mediaState.isPlaying : true);
 
   useEffect(() => {
-    const video = videoRef.current;
+    const container = containerRef.current;
+    const video = container?.querySelector('video') ?? null;
     if (!video) {
       return;
     }
@@ -84,7 +85,8 @@ export function VideoFallbackLayer({
   }, [resolvedSrc, shouldPlay]);
 
   useEffect(() => {
-    const video = videoRef.current;
+    const container = containerRef.current;
+    const video = container?.querySelector('video') ?? null;
     if (!video || !mediaState) {
       return;
     }
@@ -99,7 +101,8 @@ export function VideoFallbackLayer({
   }, [mediaState, shouldPlay]);
 
   useEffect(() => {
-    const video = videoRef.current;
+    const container = containerRef.current;
+    const video = container?.querySelector('video') ?? null;
     if (!video || !mediaState) {
       return;
     }
@@ -153,7 +156,8 @@ export function VideoFallbackLayer({
   }, [mediaState, resolvedSrc]);
 
   useEffect(() => {
-    const video = videoRef.current;
+    const container = containerRef.current;
+    const video = container?.querySelector('video') ?? null;
     if (!video || !mediaState) {
       return;
     }
@@ -169,15 +173,11 @@ export function VideoFallbackLayer({
   }, [mediaState, resolvedSrc]);
 
   return (
-    <video
+    <div
       ref={handleVideoRef}
       className="fallback-layer"
       id={id}
-      src={resolvedSrc}
-      muted
-      loop
-      playsInline
-      autoPlay
+      data-video-src={resolvedSrc}
       style={{
         opacity,
         mixBlendMode: mixBlend,

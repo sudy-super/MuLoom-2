@@ -20,6 +20,12 @@ export function useRTCStreaming(
   const pendingPlaybackRef = useRef<{ element: HTMLVideoElement; stream: MediaStream } | null>(
     null,
   );
+  const reconnectAttemptsRef = useRef(0);
+  const reconnectTimeoutRef = useRef<number | null>(null);
+  const frameMonitorRef = useRef<number | null>(null);
+  const lastFrameProgressRef = useRef<number>(0);
+  const lastVideoTimeRef = useRef<number>(0);
+  const stalledRef = useRef(false);
   const onSignalRef = useRef(onSignal);
 
   onSignalRef.current = onSignal;
@@ -30,23 +36,103 @@ export function useRTCStreaming(
     }
   }, []);
 
-  const updateConnectionState = useCallback((state: RTCPeerConnectionState) => {
-    switch (state) {
-      case 'connected': {
-        setConnectionState('connected');
-        break;
-      }
-      case 'failed':
-      case 'disconnected':
-      case 'closed': {
-        setConnectionState('disconnected');
-        break;
-      }
-      default: {
-        setConnectionState('connecting');
-      }
+  const clearReconnectTimeout = useCallback(() => {
+    if (reconnectTimeoutRef.current !== null) {
+      window.clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
     }
   }, []);
+
+  const scheduleReconnect = useCallback(() => {
+    if (reconnectTimeoutRef.current !== null) {
+      return;
+    }
+    const attempt = reconnectAttemptsRef.current;
+    const delay = Math.min(5000, 500 * 2 ** attempt);
+    reconnectAttemptsRef.current = attempt + 1;
+    reconnectTimeoutRef.current = window.setTimeout(() => {
+      reconnectTimeoutRef.current = null;
+      emitSignal({
+        type: 'rtc-signal',
+        rtc: 'request-offer',
+        payload: null,
+      });
+    }, delay);
+  }, [emitSignal]);
+
+  const stopFrameMonitor = useCallback(() => {
+    if (frameMonitorRef.current !== null) {
+      cancelAnimationFrame(frameMonitorRef.current);
+      frameMonitorRef.current = null;
+    }
+  }, []);
+
+  const startFrameMonitor = useCallback(
+    (element: HTMLVideoElement) => {
+      stopFrameMonitor();
+      lastFrameProgressRef.current = performance.now();
+      lastVideoTimeRef.current = element.currentTime;
+      stalledRef.current = false;
+
+      const check = () => {
+        const stream = element.srcObject as MediaStream | null;
+        const track = stream?.getVideoTracks()[0];
+        const now = performance.now();
+        const currentTime = element.currentTime;
+
+        if (Number.isFinite(currentTime) && currentTime > lastVideoTimeRef.current + 0.015) {
+          lastVideoTimeRef.current = currentTime;
+          lastFrameProgressRef.current = now;
+          stalledRef.current = false;
+        }
+
+        if (track && track.readyState === 'ended' && !stalledRef.current) {
+          stalledRef.current = true;
+          scheduleReconnect();
+          stopFrameMonitor();
+          return;
+        }
+
+        if (now - lastFrameProgressRef.current > 3000 && !stalledRef.current) {
+          stalledRef.current = true;
+          scheduleReconnect();
+        }
+
+        frameMonitorRef.current = requestAnimationFrame(check);
+      };
+
+      frameMonitorRef.current = requestAnimationFrame(check);
+    },
+    [scheduleReconnect, stopFrameMonitor],
+  );
+
+  const updateConnectionState = useCallback(
+    (state: RTCPeerConnectionState) => {
+      switch (state) {
+        case 'connected': {
+          clearReconnectTimeout();
+          reconnectAttemptsRef.current = 0;
+          stalledRef.current = false;
+          setConnectionState('connected');
+          break;
+        }
+        case 'failed':
+        case 'disconnected': {
+          setConnectionState('disconnected');
+          scheduleReconnect();
+          break;
+        }
+        case 'closed': {
+          setConnectionState('disconnected');
+          break;
+        }
+        default: {
+          setConnectionState('connecting');
+        }
+      }
+    },
+    [clearReconnectTimeout, scheduleReconnect],
+  );
 
   const closeConnection = useCallback(() => {
     const pc = peerConnectionRef.current;
@@ -62,9 +148,15 @@ export function useRTCStreaming(
       remoteMediaRef.current = null;
     }
     pendingPlaybackRef.current = null;
+    clearReconnectTimeout();
+    stopFrameMonitor();
+    stalledRef.current = false;
+    reconnectAttemptsRef.current = 0;
+    lastFrameProgressRef.current = 0;
+    lastVideoTimeRef.current = 0;
     setAutoplayBlocked(false);
     setConnectionState('disconnected');
-  }, []);
+  }, [clearReconnectTimeout, stopFrameMonitor]);
 
   const createPeerConnection = useCallback(() => {
     closeConnection();
@@ -93,6 +185,27 @@ export function useRTCStreaming(
     setConnectionState('connecting');
     return pc;
   }, [closeConnection, emitSignal, options.iceServers, updateConnectionState]);
+
+  const retryAutoplay = useCallback(async () => {
+    const pending = pendingPlaybackRef.current;
+    if (!pending) {
+      return true;
+    }
+    try {
+      const result = pending.element.play();
+      if (result && typeof result.then === 'function') {
+        await result;
+      }
+      pendingPlaybackRef.current = null;
+      setAutoplayBlocked(false);
+      startFrameMonitor(pending.element);
+      return true;
+    } catch (error) {
+      console.warn('useRTCStreaming: autoplay retry failed.', error);
+      setAutoplayBlocked(true);
+      return false;
+    }
+  }, [startFrameMonitor]);
 
   const initBroadcaster = useCallback(
     async (stream: MediaStream) => {
@@ -159,39 +272,70 @@ export function useRTCStreaming(
       }
       pc.ontrack = (event) => {
         const [stream] = event.streams;
-        if (stream) {
-          remoteMediaRef.current = stream;
-          pendingPlaybackRef.current = null;
-          // Assigning the stream inside requestAnimationFrame helps avoid
-          // "play() request was interrupted" errors on some browsers.
-          requestAnimationFrame(() => {
-            videoElement.srcObject = stream;
-            if (typeof videoElement.play === 'function') {
-              try {
-                const result = videoElement.play();
-                if (result && typeof result.then === 'function') {
-                  result
-                    .then(() => {
-                      pendingPlaybackRef.current = null;
-                      setAutoplayBlocked(false);
-                    })
-                    .catch((error) => {
-                      pendingPlaybackRef.current = { element: videoElement, stream };
-                      setAutoplayBlocked(true);
-                      console.warn('useRTCStreaming: autoplay blocked by browser.', error);
-                    });
-                } else {
-                  pendingPlaybackRef.current = null;
-                  setAutoplayBlocked(false);
-                }
-              } catch (error) {
-                pendingPlaybackRef.current = { element: videoElement, stream };
-                setAutoplayBlocked(true);
-                console.warn('useRTCStreaming: autoplay attempt threw synchronously.', error);
-              }
-            }
-          });
+        if (!stream) {
+          return;
         }
+
+        remoteMediaRef.current = stream;
+        pendingPlaybackRef.current = null;
+        reconnectAttemptsRef.current = 0;
+        stalledRef.current = false;
+
+        stream.getVideoTracks().forEach((track) => {
+          track.onended = () => {
+            scheduleReconnect();
+            stopFrameMonitor();
+          };
+          track.onmute = () => {
+            stalledRef.current = true;
+            scheduleReconnect();
+          };
+          track.onunmute = () => {
+            stalledRef.current = false;
+            lastFrameProgressRef.current = performance.now();
+            void retryAutoplay();
+          };
+        });
+
+        // Assigning the stream inside requestAnimationFrame helps avoid
+        // "play() request was interrupted" errors on some browsers.
+        requestAnimationFrame(() => {
+          videoElement.autoplay = true;
+          videoElement.muted = true;
+          videoElement.playsInline = true;
+          videoElement.srcObject = stream;
+
+          if (typeof videoElement.play === 'function') {
+            try {
+              const result = videoElement.play();
+              if (result && typeof result.then === 'function') {
+                result
+                  .then(() => {
+                    pendingPlaybackRef.current = null;
+                    setAutoplayBlocked(false);
+                    startFrameMonitor(videoElement);
+                  })
+                  .catch((error) => {
+                    pendingPlaybackRef.current = { element: videoElement, stream };
+                    setAutoplayBlocked(true);
+                    console.warn('useRTCStreaming: autoplay blocked by browser.', error);
+                  });
+              } else {
+                pendingPlaybackRef.current = null;
+                setAutoplayBlocked(false);
+                startFrameMonitor(videoElement);
+              }
+            } catch (error) {
+              pendingPlaybackRef.current = { element: videoElement, stream };
+              setAutoplayBlocked(true);
+              console.warn('useRTCStreaming: autoplay attempt threw synchronously.', error);
+            }
+          } else {
+            pendingPlaybackRef.current = null;
+            setAutoplayBlocked(false);
+            startFrameMonitor(videoElement);
+          }
+        });
       };
       try {
         await pc.setRemoteDescription(offer);
@@ -204,28 +348,8 @@ export function useRTCStreaming(
         return null;
       }
     },
-    [closeConnection, createPeerConnection],
+    [closeConnection, createPeerConnection, retryAutoplay, scheduleReconnect, startFrameMonitor, stopFrameMonitor],
   );
-
-  const retryAutoplay = useCallback(async () => {
-    const pending = pendingPlaybackRef.current;
-    if (!pending) {
-      return true;
-    }
-    try {
-      const result = pending.element.play();
-      if (result && typeof result.then === 'function') {
-        await result;
-      }
-      pendingPlaybackRef.current = null;
-      setAutoplayBlocked(false);
-      return true;
-    } catch (error) {
-      console.warn('useRTCStreaming: autoplay retry failed.', error);
-      setAutoplayBlocked(true);
-      return false;
-    }
-  }, []);
 
   useEffect(() => () => {
     closeConnection();
