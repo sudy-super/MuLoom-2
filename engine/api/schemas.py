@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field, ConfigDict, validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, validator
 
 
 class DeckModel(BaseModel):
@@ -62,6 +62,28 @@ class ViewerStatusModel(BaseModel):
     @validator("audioSensitivity", pre=True)
     def _clamp_audio_sensitivity(cls, value: float) -> float:
         return max(0.0, float(value))
+
+
+class TransportCommandRequest(BaseModel):
+    op: str
+    rev: Optional[int] = None
+    position_us: Optional[int] = Field(
+        default=None,
+        validation_alias=AliasChoices("position_us", "positionUs", "pos_us", "posUs", "position"),
+    )
+    rate: Optional[float] = Field(
+        default=None,
+        validation_alias=AliasChoices("rate", "value", "playRate", "speed"),
+    )
+
+    model_config = ConfigDict(populate_by_name=True, validate_assignment=True)
+
+    @validator("op", pre=True)
+    def _normalise_op(cls, value: object) -> str:
+        result = str(value or "").strip()
+        if not result:
+            raise ValueError("op is required")
+        return result
 
 
 class PrerenderRequest(BaseModel):

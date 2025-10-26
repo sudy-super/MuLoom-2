@@ -35,6 +35,7 @@ import yaml
 
 from .. import EngineConfig
 from ..pipeline import OutputConfig, OutputType, SourceType, VideoSourceConfig
+from ..timeline import InvalidCommand, RevisionMismatch
 from ..utils.assets import MP4_DIR, ROOT_DIR, read_fallback_assets
 from . import schemas
 from .state import DeckLoadError, DeckManager, EngineState
@@ -376,6 +377,7 @@ class RealtimeManager:
         ack_timeout: float = 5.0,
         max_ack_retries: int = 3,
         hello_timeout: float = 5.0,
+        transport_tick_hz: float = 30.0,
     ) -> None:
         self.state = state
         self.assets_loader = assets_loader
@@ -387,10 +389,102 @@ class RealtimeManager:
         self.ack_timeout = max(0.0, float(ack_timeout))
         self.max_ack_retries = max(0, int(max_ack_retries))
         self.hello_timeout = max(0.1, float(hello_timeout))
+        self.transport_tick_interval = 1.0 / max(1.0, float(transport_tick_hz))
 
         self._sessions: Dict[str, RealtimeSession] = {}
         self._deck_sessions: Dict[str, Set[RealtimeSession]] = defaultdict(set)
         self._lock = asyncio.Lock()
+        self._tick_task: Optional[asyncio.Task] = None
+        self._running = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._timeline_subscription: Optional[int] = None
+
+    async def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._loop = asyncio.get_running_loop()
+        if self._timeline_subscription is not None:
+            self.state.timeline.unsubscribe(self._timeline_subscription)
+            self._timeline_subscription = None
+        self._timeline_subscription = self.state.timeline.subscribe(self._handle_timeline_snapshot)
+        self._tick_task = asyncio.create_task(self._transport_tick_loop())
+
+    async def stop(self) -> None:
+        if not self._running:
+            return
+        self._running = False
+
+        if self._tick_task:
+            self._tick_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._tick_task
+            self._tick_task = None
+
+        if self._timeline_subscription is not None:
+            self.state.timeline.unsubscribe(self._timeline_subscription)
+            self._timeline_subscription = None
+
+        self._loop = None
+
+    def _handle_timeline_snapshot(self, snapshot) -> None:
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        snapshot_dict = snapshot.to_dict()
+        try:
+            loop.call_soon_threadsafe(self._schedule_transport_broadcast, snapshot_dict)
+        except RuntimeError:
+            LOG.debug("Timeline broadcast scheduling failed; loop is shutting down.", exc_info=True)
+
+    def _schedule_transport_broadcast(self, snapshot_dict: Dict[str, Any]) -> None:
+        if not self._running:
+            return
+
+        async def _broadcast() -> None:
+            try:
+                await self.broadcast(
+                    {"type": "transport", "payload": snapshot_dict},
+                    allow_drop=False,
+                )
+            except Exception:  # pragma: no cover - defensive
+                LOG.exception("Failed to broadcast transport snapshot.")
+
+        asyncio.create_task(_broadcast())
+
+    async def _transport_tick_loop(self) -> None:
+        try:
+            while self._running:
+                await asyncio.sleep(self.transport_tick_interval)
+                if not self._running:
+                    break
+                async with self._lock:
+                    has_sessions = bool(self._sessions)
+                if not has_sessions:
+                    continue
+                mono_us = time.monotonic_ns() // 1000
+                snapshot = self.state.timeline.snapshot()
+                payload = {
+                    "type": "transport-tick",
+                    "payload": {
+                        "rev": snapshot.rev,
+                        "mono_us": mono_us,
+                        "playing": snapshot.playing,
+                        "rate": snapshot.rate,
+                        "pos_us": snapshot.pos_us,
+                        "t0_us": snapshot.t0_us,
+                    },
+                }
+                try:
+                    await self.broadcast(payload, allow_drop=True)
+                except Exception:  # pragma: no cover - defensive
+                    LOG.exception("Failed to broadcast transport tick.")
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Transport tick loop failed.")
+        finally:
+            self._tick_task = None
 
     async def run(self, websocket: WebSocket) -> None:
         session = RealtimeSession(self, websocket, queue_size=self.queue_size)
@@ -573,6 +667,10 @@ class RealtimeManager:
             await self._handle_load_deck(session, message)
             return
 
+        if message_type == "transport-command":
+            await self._handle_transport_command(session, message)
+            return
+
         if message_type in {
             "start-visualization",
             "stop-visualization",
@@ -645,6 +743,119 @@ class RealtimeManager:
                     exclude=session,
                 )
             return
+
+    @staticmethod
+    def _extract_position_us(payload: Dict[str, Any]) -> Optional[int]:
+        micro_keys = ("position_us", "positionUs", "pos_us", "posUs")
+        for key in micro_keys:
+            if key in payload and payload[key] is not None:
+                try:
+                    return max(0, int(float(payload[key])))
+                except (TypeError, ValueError):
+                    continue
+
+        second_keys = ("position_s", "positionSeconds", "position", "seconds")
+        for key in second_keys:
+            if key in payload and payload[key] is not None:
+                try:
+                    seconds = float(payload[key])
+                except (TypeError, ValueError):
+                    continue
+                microseconds = int(round(seconds * 1_000_000))
+                return max(0, microseconds)
+        return None
+
+    @staticmethod
+    def _extract_rate(payload: Dict[str, Any]) -> Optional[float]:
+        for key in ("rate", "value", "playRate", "speed"):
+            if key in payload and payload[key] is not None:
+                try:
+                    return float(payload[key])
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    async def _handle_transport_command(
+        self,
+        session: RealtimeSession,
+        message: Dict[str, Any],
+    ) -> None:
+        if session.client_role not in {"controller", "admin", "operator"}:
+            LOG.warning(
+                "Ignoring transport-command from non-controller session=%s role=%s",
+                session.session_id,
+                session.client_role,
+            )
+            return
+
+        payload = message.get("payload") or {}
+        op_value = payload.get("op") or payload.get("operation")
+        command_id = str(message.get("commandId") or payload.get("commandId") or uuid.uuid4().hex)
+
+        if not isinstance(op_value, str) or not op_value.strip():
+            await session.send(
+                {
+                    "type": "transport-error",
+                    "commandId": command_id,
+                    "payload": {
+                        "code": "E_INVALID_PAYLOAD",
+                        "message": "transport-command requires payload.op",
+                    },
+                }
+            )
+            return
+
+        try:
+            rev_value = payload.get("rev")
+            expected_rev = int(rev_value) if rev_value is not None else None
+        except (TypeError, ValueError):
+            expected_rev = None
+
+        position_us = self._extract_position_us(payload)
+        rate_value = self._extract_rate(payload)
+
+        try:
+            snapshot_dict = self.state.apply_transport_command(
+                op_value,
+                rev=expected_rev,
+                position_us=position_us,
+                rate=rate_value,
+            )
+        except RevisionMismatch as exc:
+            await session.send(
+                {
+                    "type": "transport-error",
+                    "commandId": command_id,
+                    "payload": {
+                        "code": "E_REVISION_MISMATCH",
+                        "message": str(exc),
+                        "transport": self.state.timeline.snapshot().to_dict(),
+                    },
+                }
+            )
+            return
+        except InvalidCommand as exc:
+            await session.send(
+                {
+                    "type": "transport-error",
+                    "commandId": command_id,
+                    "payload": {
+                        "code": "E_INVALID_COMMAND",
+                        "message": str(exc),
+                    },
+                }
+            )
+            return
+
+        await session.send(
+            {
+                "type": "transport",
+                "payload": snapshot_dict,
+                "commandId": command_id,
+            },
+            require_ack=True,
+            command_id=command_id,
+        )
 
     async def _handle_load_deck(self, session: RealtimeSession, message: Dict[str, Any]) -> None:
         deck_id = str(message.get("deckId") or session.deck_id or "default")
@@ -778,6 +989,14 @@ def create_app(
         allow_headers=["*"],
     )
 
+    @app.on_event("startup")
+    async def _startup() -> None:
+        await realtime.start()
+
+    @app.on_event("shutdown")
+    async def _shutdown() -> None:
+        await realtime.stop()
+
     app.mount(
         "/assets/mp4",
         StaticFiles(directory=str(MP4_DIR), check_dir=False),
@@ -852,6 +1071,25 @@ def create_app(
             "state": engine_state.snapshot(),
             "assets": read_fallback_assets(),
         }
+
+    @app.get("/engine/transport")
+    async def get_transport_state() -> dict:
+        return engine_state.timeline.snapshot().to_dict()
+
+    @app.post("/engine/command")
+    async def apply_transport(payload: schemas.TransportCommandRequest) -> dict:
+        try:
+            snapshot_dict = engine_state.apply_transport_command(
+                payload.op,
+                rev=payload.rev,
+                position_us=payload.position_us,
+                rate=payload.rate,
+            )
+        except RevisionMismatch as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except InvalidCommand as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"transport": snapshot_dict}
 
     @app.get("/mix", response_model=schemas.MixStateModel)
     async def get_mix() -> schemas.MixStateModel:

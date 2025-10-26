@@ -14,9 +14,11 @@ import json
 import logging
 import threading
 import sys
+import math
 from typing import Dict, List, Optional, Tuple
 
 from ..pipeline import DeckRuntimeState, OutputType, Pipeline, SourceType
+from ..timeline import TimelineTransport, TransportSnapshot
 
 LOG = logging.getLogger(__name__)
 
@@ -202,17 +204,66 @@ class GStreamerPipelineAdapter(PipelineAdapter):
     pipeline state.
     """
 
-    def __init__(self, pipeline: Pipeline) -> None:
+    def __init__(self, pipeline: Pipeline, timeline: Optional[TimelineTransport] = None) -> None:
         super().__init__(pipeline)
         self._gst_pipeline: Optional["Gst.Pipeline"] = None
         self._started = False
         self._deck_handlers: List[Tuple["Gst.Element", int]] = []
         self._deck_sink_pads: List["Gst.Pad"] = []
         self._tee_pads: List["Gst.Pad"] = []
+        self._timeline: Optional[TimelineTransport] = None
+        self._timeline_subscription_id: Optional[int] = None
+        self._transport_snapshot: Optional[TransportSnapshot] = None
+        self._shared_clock: Optional["Gst.Clock"] = None  # type: ignore[name-defined]
+        self._last_playing: Optional[bool] = None
+
+        if timeline is not None:
+            self.attach_timeline(timeline)
 
     @property
     def is_available(self) -> bool:
         return Gst is not None
+
+    def attach_timeline(self, timeline: Optional[TimelineTransport]) -> None:
+        with self._lock:
+            if self._timeline is timeline:
+                return
+            to_unsubscribe = None
+            if self._timeline is not None and self._timeline_subscription_id is not None:
+                to_unsubscribe = (self._timeline, self._timeline_subscription_id)
+            self._timeline = timeline
+            self._timeline_subscription_id = None
+
+        if to_unsubscribe:
+            previous_timeline, token = to_unsubscribe
+            try:
+                previous_timeline.unsubscribe(token)
+            except Exception:  # pragma: no cover - defensive
+                LOG.debug("Failed to unsubscribe previous timeline observer.", exc_info=True)
+
+        if timeline is None:
+            return
+
+        subscription_id = timeline.subscribe(self._on_timeline_snapshot)
+        with self._lock:
+            self._timeline_subscription_id = subscription_id
+            self._transport_snapshot = timeline.snapshot()
+
+    def detach_timeline(self) -> None:
+        with self._lock:
+            if self._timeline is None or self._timeline_subscription_id is None:
+                self._timeline = None
+                self._timeline_subscription_id = None
+                return
+            timeline = self._timeline
+            token = self._timeline_subscription_id
+            self._timeline = None
+            self._timeline_subscription_id = None
+
+        try:
+            timeline.unsubscribe(token)
+        except Exception:  # pragma: no cover - defensive
+            LOG.debug("Failed to unsubscribe timeline observer during detach.", exc_info=True)
 
     def start(self) -> None:
         if Gst is None:
@@ -227,10 +278,15 @@ class GStreamerPipelineAdapter(PipelineAdapter):
         super().start()
 
     def stop(self) -> None:
-        if Gst is None or not self._started:
+        if Gst is None:
+            self.detach_timeline()
+            return
+        if not self._started:
+            self.detach_timeline()
             return
         super().stop()
         self._started = False
+        self.detach_timeline()
 
     # ------------------------------------------------------------------ overrides
 
@@ -297,6 +353,13 @@ class GStreamerPipelineAdapter(PipelineAdapter):
                 self._build_default_outputs(pipeline, tee)
 
             self._gst_pipeline = pipeline
+            try:
+                clock = Gst.SystemClock.obtain()
+                pipeline.use_clock(clock)
+                pipeline.set_start_time(Gst.CLOCK_TIME_NONE)
+                self._shared_clock = clock
+            except Exception:
+                LOG.debug("Failed to obtain or apply shared clock.", exc_info=True)
 
         self._activate_pipeline()
 
@@ -314,10 +377,15 @@ class GStreamerPipelineAdapter(PipelineAdapter):
         pipeline = self._gst_pipeline
         if not pipeline:
             return
-        result = pipeline.set_state(Gst.State.PLAYING)
-        if result == Gst.StateChangeReturn.FAILURE:
-            LOG.error("Failed to set GStreamer pipeline to PLAYING state.")
-            pipeline.set_state(Gst.State.NULL)
+        try:
+            pipeline.set_state(Gst.State.PAUSED)
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Failed to set GStreamer pipeline to PAUSED state during activation.")
+        snapshot = None
+        with self._lock:
+            snapshot = self._transport_snapshot
+        if snapshot is not None:
+            self._apply_transport_snapshot(snapshot, previous=None)
 
     def _teardown_locked(self) -> None:
         if Gst is None:
@@ -329,6 +397,10 @@ class GStreamerPipelineAdapter(PipelineAdapter):
             pipeline.set_state(Gst.State.NULL)
         except Exception:  # pragma: no cover - defensive
             LOG.exception("Error while stopping GStreamer pipeline.")
+        try:
+            pipeline.use_clock(None)
+        except Exception:  # pragma: no cover - defensive
+            LOG.debug("Failed to detach clock from pipeline during teardown.", exc_info=True)
 
         for element, handler_id in self._deck_handlers:
             try:
@@ -356,6 +428,83 @@ class GStreamerPipelineAdapter(PipelineAdapter):
         self._tee_pads.clear()
 
         self._gst_pipeline = None
+        self._last_playing = None
+        self._shared_clock = None
+
+    # ------------------------------------------------------------- timeline sync
+
+    def _on_timeline_snapshot(self, snapshot: TransportSnapshot) -> None:
+        previous: Optional[TransportSnapshot]
+        with self._lock:
+            previous = self._transport_snapshot
+            self._transport_snapshot = snapshot
+        self._apply_transport_snapshot(snapshot, previous)
+
+    def _apply_transport_snapshot(
+        self,
+        snapshot: TransportSnapshot,
+        previous: Optional[TransportSnapshot],
+    ) -> None:
+        if Gst is None:
+            return
+        pipeline = self._gst_pipeline
+        if not pipeline:
+            return
+
+        need_seek = True
+        if previous is not None:
+            need_seek = (
+                previous.rev != snapshot.rev
+                or previous.pos_us != snapshot.pos_us
+                or abs(previous.rate - snapshot.rate) > 1e-9
+            )
+
+        if need_seek:
+            start_ns = max(0, int(snapshot.pos_us)) * 1000
+            self._send_seek(pipeline, rate=snapshot.rate, start_ns=start_ns)
+
+        if previous is None or previous.playing != snapshot.playing or self._last_playing != snapshot.playing:
+            target_state = Gst.State.PLAYING if snapshot.playing else Gst.State.PAUSED
+            result = pipeline.set_state(target_state)
+            if result == Gst.StateChangeReturn.FAILURE:
+                state_label = getattr(target_state, "value_nick", str(target_state))
+                LOG.error("Failed to set GStreamer pipeline state to %s.", state_label)
+        self._last_playing = snapshot.playing
+
+    def _send_seek(self, pipeline: "Gst.Pipeline", *, rate: float, start_ns: int) -> None:
+        flags = (
+            Gst.SeekFlags.FLUSH
+            | Gst.SeekFlags.ACCURATE
+            | Gst.SeekFlags.SEGMENT
+        )
+        rate_value = float(rate if isinstance(rate, (int, float)) else 1.0)
+        if not math.isfinite(rate_value) or rate_value < 0.0:
+            rate_value = 0.0
+
+        start_value = int(max(0, start_ns))
+        max_int64 = (1 << 63) - 1
+        if start_value > max_int64:
+            LOG.warning(
+                "Requested seek position %s ns exceeds int64; clamping to %s.",
+                start_value,
+                max_int64,
+            )
+            start_value = max_int64
+
+        event = Gst.Event.new_seek(
+            rate_value,
+            Gst.Format.TIME,
+            flags,
+            Gst.SeekType.SET,
+            start_value,
+            Gst.SeekType.NONE,
+            -1,
+        )
+        try:
+            if not pipeline.send_event(event):
+                LOG.warning("Pipeline rejected seek event for transport update.")
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Failed to dispatch seek event to pipeline.")
 
     # -------------------------------------------------------------- deck builds
 
@@ -541,7 +690,8 @@ class GStreamerPipelineAdapter(PipelineAdapter):
                 sink.set_property("sync", False)
         if not all([queue, convert, sink]):
             return False
-        sink.set_property("sync", False)
+        if sink.find_property("sync") is not None:
+            sink.set_property("sync", True)
 
         for element in (queue, convert, sink):
             pipeline.add(element)

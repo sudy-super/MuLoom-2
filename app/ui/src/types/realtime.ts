@@ -54,6 +54,31 @@ export interface ControlSettings {
   prompt: string;
 }
 
+export interface TransportSnapshot {
+  rev: number;
+  playing: boolean;
+  rate: number;
+  pos_us: number;
+  t0_us: number;
+}
+
+export const createDefaultTransportSnapshot = (): TransportSnapshot => ({
+  rev: 0,
+  playing: false,
+  rate: 1,
+  pos_us: 0,
+  t0_us: 0,
+});
+
+export interface TransportTickPayload {
+  rev: number;
+  mono_us: number;
+  playing: boolean;
+  rate: number;
+  pos_us: number;
+  t0_us: number;
+}
+
 export interface DeckTimelineState {
   src: string | null;
   isPlaying: boolean;
@@ -121,6 +146,19 @@ export interface DeckMediaStateMessagePayload<TState = DeckTimelineState> {
   state: TState;
 }
 
+export type TransportCommandPayload = {
+  op: string;
+  rev?: number;
+  position_us?: number;
+  positionUs?: number;
+  positionSeconds?: number;
+  position?: number;
+  rate?: number;
+  value?: number;
+  playRate?: number;
+  speed?: number;
+};
+
 export type RTCSignalType = 'offer' | 'answer' | 'ice-candidate' | 'request-offer';
 
 export type RTCSignalMessage =
@@ -142,6 +180,7 @@ export type OutboundMessage =
   | { type: 'viewer-status'; payload: Partial<ViewerStatus> }
   | { type: 'code-progress'; payload: { code: string; isComplete: boolean } }
   | { type: 'deck-media-state'; payload: DeckMediaStateMessagePayload<DeckMediaStateIntent> }
+  | { type: 'transport-command'; payload: TransportCommandPayload & { commandId?: string } }
   | RTCSignalMessage;
 
 export type InboundMessage =
@@ -170,4 +209,11 @@ export type InboundMessage =
   | { type: 'regenerate-shader' }
   | { type: 'set-audio-sensitivity'; payload: { value: number } }
   | { type: 'deck-media-state'; payload: DeckMediaStateMessagePayload }
+  | {
+      type: 'transport-error';
+      commandId?: string;
+      payload: { code: string; message: string; transport?: TransportSnapshot };
+    }
+  | { type: 'transport'; payload: TransportSnapshot; commandId?: string }
+  | { type: 'transport-tick'; payload: TransportTickPayload }
   | RTCSignalMessage;

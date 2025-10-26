@@ -56,7 +56,7 @@ async def serve(config: EngineConfig, host: str = "127.0.0.1", port: int = 8080)
     import uvicorn
 
     engine_state = EngineState()
-    gst_adapter = GStreamerPipelineAdapter(engine_state.pipeline)
+    gst_adapter = GStreamerPipelineAdapter(engine_state.pipeline, timeline=engine_state.timeline)
     configure_logging()
 
     @asynccontextmanager

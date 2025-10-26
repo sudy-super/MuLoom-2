@@ -12,9 +12,11 @@ import type {
   OutboundMessage,
   RTCSignalMessage,
   StartVisualizationPayload,
+  TransportCommandPayload,
+  TransportSnapshot,
   ViewerStatus,
 } from '../types/realtime';
-import { createDefaultDeckTimelineState } from '../types/realtime';
+import { createDefaultDeckTimelineState, createDefaultTransportSnapshot } from '../types/realtime';
 import { MIX_DECK_KEYS, type DeckKey } from '../utils/mix';
 
 const EMPTY_DECK: MixDeck = { type: null, assetId: null, opacity: 0, enabled: false };
@@ -97,6 +99,10 @@ export interface RealtimeHandlers {
 }
 
 export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHandlers = {}) {
+  const getNowMs = () =>
+    typeof performance !== 'undefined' && typeof performance.now === 'function'
+      ? performance.now()
+      : Date.now();
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   const [fallbackLayers, setFallbackLayers] = useState<FallbackLayer[]>([]);
   const [controlSettings, setControlSettings] = useState<ControlSettings>({
@@ -108,6 +114,12 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
     isRunning: false,
     isGenerating: false,
     error: '',
+  });
+  const [transport, setTransport] = useState<TransportSnapshot>(() => createDefaultTransportSnapshot());
+  const transportRef = useRef<TransportSnapshot>(createDefaultTransportSnapshot());
+  const [transportTick, setTransportTick] = useState<{ mono_us: number; receivedAt: number }>({
+    mono_us: 0,
+    receivedAt: 0,
   });
   const [assets, setAssets] = useState<FallbackAssets>(() =>
     normaliseAssetUrls({
@@ -293,6 +305,54 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
     [requestDeckState],
   );
 
+  const requestTransportCommand = useCallback(
+    (command: TransportCommandPayload) => {
+      const commandId = nextCommandId();
+      const payload: TransportCommandPayload & { commandId: string } = {
+        op: command.op,
+        commandId,
+      };
+
+      if (typeof command.rev === 'number' && Number.isFinite(command.rev)) {
+        payload.rev = Number(command.rev);
+      }
+
+      const positionCandidates = [
+        command.position_us,
+        command.positionUs,
+        command.positionSeconds,
+        command.position,
+      ];
+      const resolvedPosition = positionCandidates.find((value) =>
+        typeof value === 'number' && Number.isFinite(value),
+      );
+      if (typeof resolvedPosition === 'number' && Number.isFinite(resolvedPosition)) {
+        const isMicroseconds =
+          resolvedPosition > 1_000 && !(command.positionSeconds || command.position);
+        const microValue = isMicroseconds
+          ? resolvedPosition
+          : resolvedPosition * 1_000_000;
+        payload.position_us = Math.max(0, Math.round(microValue));
+      }
+
+      const rateCandidates = [command.rate, command.value, command.playRate, command.speed];
+      const resolvedRate = rateCandidates.find(
+        (value) => typeof value === 'number' && Number.isFinite(value),
+      );
+      if (typeof resolvedRate === 'number' && Number.isFinite(resolvedRate)) {
+        payload.rate = Math.max(0, resolvedRate);
+      }
+
+      send({
+        type: 'transport-command',
+        commandId,
+        payload,
+      });
+      return commandId;
+    },
+    [nextCommandId, send],
+  );
+
   useEffect(() => {
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const isDev = import.meta.env.DEV;
@@ -363,6 +423,28 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
               });
               return next;
             });
+            const incomingTransport = message.payload.state.transport as
+              | Partial<TransportSnapshot>
+              | undefined;
+            if (incomingTransport) {
+              const snapshot: TransportSnapshot = {
+                rev: Number.isFinite(incomingTransport.rev) ? Number(incomingTransport.rev) : 0,
+                playing: Boolean(incomingTransport.playing),
+                rate: Number.isFinite(incomingTransport.rate) ? Number(incomingTransport.rate) : 1,
+                pos_us: Number.isFinite(incomingTransport.pos_us)
+                  ? Number(incomingTransport.pos_us)
+                  : 0,
+                t0_us: Number.isFinite(incomingTransport.t0_us)
+                  ? Number(incomingTransport.t0_us)
+                  : 0,
+              };
+              transportRef.current = snapshot;
+              setTransport(snapshot);
+            } else {
+              const snapshot = createDefaultTransportSnapshot();
+              transportRef.current = snapshot;
+              setTransport(snapshot);
+            }
             break;
           }
           case 'fallback-layers': {
@@ -375,6 +457,56 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
           }
           case 'mix-state': {
             setMixState(normaliseMixState(message.payload));
+            break;
+          }
+          case 'transport': {
+            const snapshotPayload = message.payload ?? createDefaultTransportSnapshot();
+            const snapshot: TransportSnapshot = {
+              rev: typeof snapshotPayload.rev === 'number' ? snapshotPayload.rev : 0,
+              playing: Boolean(snapshotPayload.playing),
+              rate: Number.isFinite(snapshotPayload.rate) ? Number(snapshotPayload.rate) : 1,
+              pos_us: Number.isFinite(snapshotPayload.pos_us)
+                ? Number(snapshotPayload.pos_us)
+                : transportRef.current.pos_us,
+              t0_us: Number.isFinite(snapshotPayload.t0_us)
+                ? Number(snapshotPayload.t0_us)
+                : transportRef.current.t0_us,
+            };
+            transportRef.current = snapshot;
+            setTransport(snapshot);
+            break;
+          }
+          case 'transport-tick': {
+            const payload = message.payload;
+            if (payload && Number.isFinite(payload.mono_us)) {
+              const tick = {
+                mono_us: Number(payload.mono_us),
+                receivedAt: getNowMs(),
+              };
+              setTransportTick(tick);
+            }
+            break;
+          }
+          case 'transport-error': {
+            if (message.payload?.transport) {
+              const transportSnapshot = message.payload.transport;
+              const snapshot: TransportSnapshot = {
+                rev: Number.isFinite(transportSnapshot.rev) ? Number(transportSnapshot.rev) : 0,
+                playing: Boolean(transportSnapshot.playing),
+                rate: Number.isFinite(transportSnapshot.rate)
+                  ? Number(transportSnapshot.rate)
+                  : transportRef.current.rate,
+                pos_us: Number.isFinite(transportSnapshot.pos_us)
+                  ? Number(transportSnapshot.pos_us)
+                  : transportRef.current.pos_us,
+                t0_us: Number.isFinite(transportSnapshot.t0_us)
+                  ? Number(transportSnapshot.t0_us)
+                  : transportRef.current.t0_us,
+              };
+              transportRef.current = snapshot;
+              setTransport(snapshot);
+            }
+            console.warn('Transport command error:', message.payload?.code, message.payload?.message);
             break;
           }
           case 'deck-media-state': {
@@ -534,6 +666,8 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
     assets,
     mixState,
     deckMediaStates,
+    transport,
+    transportTick,
     send,
     requestDeckState,
     requestDeckToggle,
@@ -542,5 +676,6 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
     requestDeckSeek,
     requestDeckRate,
     requestDeckSource,
+    requestTransportCommand,
   };
 }

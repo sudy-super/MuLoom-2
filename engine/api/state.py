@@ -13,6 +13,7 @@ from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 from ..graph.mixers import MixerLayer
 from ..pipeline import Pipeline
+from ..timeline import TimelineTransport
 
 ALLOWED_DECK_TYPES = {"shader", "video", "generative"}
 DECK_KEYS = ("a", "b", "c", "d")
@@ -468,6 +469,7 @@ class EngineState:
     Aggregated state shared between the API and the pipeline orchestrator.
     """
 
+    timeline: TimelineTransport = field(default_factory=TimelineTransport)
     pipeline: Pipeline = field(default_factory=Pipeline)
     mix: MixState = field(default_factory=MixState)
     active_profile: str = "default"
@@ -484,6 +486,7 @@ class EngineState:
             "controlSettings": self.control_settings.to_dict(),
             "viewerStatus": self.viewer_status.to_dict(),
             "mixState": self.mix.to_dict(),
+            "transport": self.timeline.snapshot().to_dict(),
             "deckMediaStates": {
                 key: state.to_dict() for key, state in self.deck_media_states.items()
             },
@@ -565,3 +568,19 @@ class EngineState:
                 source_id=self.pipeline.source_id_for_deck(key), opacity=deck.opacity
             )
         return layers
+
+    def apply_transport_command(
+        self,
+        op: str,
+        *,
+        rev: Optional[int] = None,
+        position_us: Optional[int] = None,
+        rate: Optional[float] = None,
+    ) -> dict:
+        snapshot = self.timeline.apply(
+            op,
+            expected_rev=rev,
+            position_us=position_us,
+            rate=rate,
+        )
+        return snapshot.to_dict()
