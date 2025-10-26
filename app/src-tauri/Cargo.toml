@@ -5,6 +5,9 @@ edition = "2021"
 
 [dependencies]
 tauri = { version = "2.0.0", features = ["default"] }
+anyhow = "1"
+pollster = "0.3"
+wgpu = "0.20"
 
 [build-dependencies]
 tauri-build = { version = "2.0.0", features = [] }

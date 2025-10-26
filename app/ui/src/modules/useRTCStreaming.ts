@@ -300,6 +300,37 @@ export function useRTCStreaming(
         // Assigning the stream inside requestAnimationFrame helps avoid
         // "play() request was interrupted" errors on some browsers.
         requestAnimationFrame(() => {
+          const currentStream = videoElement.srcObject as MediaStream | null;
+          if (currentStream === stream) {
+            if (videoElement.paused) {
+              try {
+                const resume = videoElement.play();
+                if (resume && typeof resume.then === 'function') {
+                  void resume.then(() => {
+                    pendingPlaybackRef.current = null;
+                    setAutoplayBlocked(false);
+                    startFrameMonitor(videoElement);
+                  }).catch((error) => {
+                    pendingPlaybackRef.current = { element: videoElement, stream };
+                    setAutoplayBlocked(true);
+                    console.warn('useRTCStreaming: autoplay blocked when resuming existing stream.', error);
+                  });
+                } else {
+                  pendingPlaybackRef.current = null;
+                  setAutoplayBlocked(false);
+                  startFrameMonitor(videoElement);
+                }
+              } catch (error) {
+                pendingPlaybackRef.current = { element: videoElement, stream };
+                setAutoplayBlocked(true);
+                console.warn('useRTCStreaming: resume attempt threw synchronously.', error);
+              }
+            } else {
+              startFrameMonitor(videoElement);
+            }
+            return;
+          }
+
           videoElement.autoplay = true;
           videoElement.muted = true;
           videoElement.playsInline = true;
