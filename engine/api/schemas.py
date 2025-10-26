@@ -66,7 +66,10 @@ class ViewerStatusModel(BaseModel):
 
 class TransportCommandRequest(BaseModel):
     op: str
-    rev: Optional[int] = None
+    expected_rev: int = Field(
+        validation_alias=AliasChoices("expected_rev", "expectedRev", "rev"),
+        serialization_alias="expected_rev",
+    )
     position_us: Optional[int] = Field(
         default=None,
         validation_alias=AliasChoices("position_us", "positionUs", "pos_us", "posUs", "position"),
@@ -84,6 +87,17 @@ class TransportCommandRequest(BaseModel):
         if not result:
             raise ValueError("op is required")
         return result
+
+    @validator("expected_rev")
+    def _validate_expected_rev(cls, value: int) -> int:
+        coerced = int(value)
+        if coerced < 0:
+            raise ValueError("expected_rev must be non-negative")
+        return coerced
+
+    @property
+    def rev(self) -> int:
+        return self.expected_rev
 
 
 class PrerenderRequest(BaseModel):

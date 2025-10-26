@@ -452,16 +452,22 @@ class GStreamerPipelineAdapter(PipelineAdapter):
             return
 
         need_seek = True
+        rate_changed = False
+        position_changed = True
         if previous is not None:
-            need_seek = (
-                previous.rev != snapshot.rev
-                or previous.pos_us != snapshot.pos_us
-                or abs(previous.rate - snapshot.rate) > 1e-9
-            )
+            rate_changed = abs(previous.rate - snapshot.rate) > 1e-9
+            position_changed = previous.pos_us != snapshot.pos_us
+            need_seek = previous.rev != snapshot.rev or position_changed or rate_changed
 
         if need_seek:
-            start_ns = max(0, int(snapshot.pos_us)) * 1000
-            self._send_seek(pipeline, rate=snapshot.rate, start_ns=start_ns)
+            if rate_changed and not position_changed:
+                handled = self._set_rate_instant(pipeline, snapshot.rate)
+                if not handled:
+                    start_ns = max(0, int(snapshot.pos_us)) * 1000
+                    self._send_seek(pipeline, rate=snapshot.rate, start_ns=start_ns)
+            else:
+                start_ns = max(0, int(snapshot.pos_us)) * 1000
+                self._send_seek(pipeline, rate=snapshot.rate, start_ns=start_ns)
 
         if previous is None or previous.playing != snapshot.playing or self._last_playing != snapshot.playing:
             target_state = Gst.State.PLAYING if snapshot.playing else Gst.State.PAUSED
@@ -470,6 +476,33 @@ class GStreamerPipelineAdapter(PipelineAdapter):
                 state_label = getattr(target_state, "value_nick", str(target_state))
                 LOG.error("Failed to set GStreamer pipeline state to %s.", state_label)
         self._last_playing = snapshot.playing
+
+    def _set_rate_instant(self, pipeline: "Gst.Pipeline", rate: float) -> bool:
+        if Gst is None:
+            return False
+        flag = getattr(Gst.SeekFlags, "INSTANT_RATE_CHANGE", None)
+        if flag is None:
+            return False
+        rate_value = float(rate if isinstance(rate, (int, float)) else 1.0)
+        if not math.isfinite(rate_value) or rate_value < 0.0:
+            rate_value = 0.0
+        flags = flag | Gst.SeekFlags.ACCURATE | Gst.SeekFlags.FLUSH
+        try:
+            result = pipeline.seek(
+                rate_value,
+                Gst.Format.TIME,
+                flags,
+                Gst.SeekType.NONE,
+                Gst.CLOCK_TIME_NONE,
+                Gst.SeekType.NONE,
+                Gst.CLOCK_TIME_NONE,
+            )
+            if not result:
+                LOG.debug("Pipeline rejected INSTANT_RATE_CHANGE seek; falling back to segment seek.")
+            return bool(result)
+        except Exception:  # pragma: no cover - defensive
+            LOG.exception("Failed to dispatch INSTANT_RATE_CHANGE seek.")
+            return False
 
     def _send_seek(self, pipeline: "Gst.Pipeline", *, rate: float, start_ns: int) -> None:
         flags = (
@@ -660,18 +693,41 @@ class GStreamerPipelineAdapter(PipelineAdapter):
             params = entry.get("params", {}) or {}
             if output_type == OutputType.SCREEN.value:
                 branch = self._build_screen_branch(pipeline, tee, params, name_suffix=entry.get("id"))
+            elif output_type == OutputType.WEBRTC.value:
+                branch = self._build_webrtc_branch(
+                    pipeline,
+                    tee,
+                    params,
+                    name_suffix=entry.get("id"),
+                )
             elif output_type == OutputType.FILE.value:
                 branch = self._build_file_branch(pipeline, tee, params, name_suffix=entry.get("id"))
             else:
-                branch = self._build_fallback_branch(pipeline, tee, name_suffix=entry.get("id"))
+                LOG.warning("Unsupported output type '%s'; skipping branch.", output_type)
+                branch = False
             built = branch or built
         return built
 
     def _build_default_outputs(self, pipeline: "Gst.Pipeline", tee: "Gst.Element") -> None:
-        # Program output
-        self._build_screen_branch(pipeline, tee, {}, name_suffix="program")
-        # Preview output (silent)
-        self._build_fallback_branch(pipeline, tee, name_suffix="preview")
+        built_screen = self._build_screen_branch(pipeline, tee, {}, name_suffix="program")
+        if not built_screen:
+            LOG.error("Failed to build default screen output; engine preview will be unavailable.")
+
+        preview_branch = getattr(self._pipeline, "preview_branch", None)
+        preview_params: Dict[str, object] = {}
+        if preview_branch is not None:
+            preview_params.update(preview_branch.iter_sink_properties())
+            if preview_branch.sink_factory:
+                preview_params.setdefault("sink_factory", preview_branch.sink_factory)
+
+        built_webrtc = self._build_webrtc_branch(
+            pipeline,
+            tee,
+            preview_params,
+            name_suffix="preview",
+        )
+        if not built_webrtc:
+            LOG.error("Failed to build default WebRTC preview branch.")
 
     def _build_screen_branch(
         self,
@@ -682,24 +738,25 @@ class GStreamerPipelineAdapter(PipelineAdapter):
         name_suffix: Optional[str],
     ) -> bool:
         queue = self._make_queue(f"screen_{name_suffix or 'out'}_queue")
-        convert = Gst.ElementFactory.make("videoconvert", f"screen_{name_suffix or 'out'}_convert")
-        sink = Gst.ElementFactory.make("autovideosink", f"screen_{name_suffix or 'out'}_sink")
-        if not sink:
-            sink = Gst.ElementFactory.make("fakesink", f"screen_{name_suffix or 'out'}_sink")
-            if sink:
-                sink.set_property("sync", False)
-        if not all([queue, convert, sink]):
+        upload = Gst.ElementFactory.make("glupload", f"screen_{name_suffix or 'out'}_upload")
+        convert = Gst.ElementFactory.make("glcolorconvert", f"screen_{name_suffix or 'out'}_convert")
+        sink = Gst.ElementFactory.make("glimagesink", f"screen_{name_suffix or 'out'}_sink")
+        if not sink or not upload or not convert:
+            LOG.error("Failed to build GL screen branch; required elements are missing.")
             return False
         if sink.find_property("sync") is not None:
             sink.set_property("sync", True)
+        if sink.find_property("qos") is not None:
+            sink.set_property("qos", True)
 
-        for element in (queue, convert, sink):
+        for element in (queue, upload, convert, sink):
             pipeline.add(element)
 
-        if not queue.link(convert) or not convert.link(sink):
-            LOG.error("Failed to link screen output branch.")
+        if not self._link_many(queue, upload, convert, sink):
+            LOG.error("Failed to link GL screen output branch.")
             return False
 
+        self._apply_element_properties(sink, params)
         return self._link_branch_to_tee(tee, queue)
 
     def _build_file_branch(
@@ -719,6 +776,96 @@ class GStreamerPipelineAdapter(PipelineAdapter):
                 location,
             )
         return self._build_fallback_branch(pipeline, tee, name_suffix=name_suffix)
+
+    def _build_webrtc_branch(
+        self,
+        pipeline: "Gst.Pipeline",
+        tee: "Gst.Element",
+        params: Dict[str, object],
+        *,
+        name_suffix: Optional[str],
+    ) -> bool:
+        queue = self._make_queue(
+            f"webrtc_{name_suffix or 'out'}_queue",
+            max_time_ns=int(0.75 * Gst.SECOND),
+            max_buffers=30,
+            leaky=2,
+        )
+        gl_upload = Gst.ElementFactory.make("glupload", f"webrtc_{name_suffix or 'out'}_glupload")
+        gl_convert = Gst.ElementFactory.make("glcolorconvert", f"webrtc_{name_suffix or 'out'}_glconvert")
+        download = Gst.ElementFactory.make("gldownload", f"webrtc_{name_suffix or 'out'}_gldownload")
+        convert = Gst.ElementFactory.make("videoconvert", f"webrtc_{name_suffix or 'out'}_convert")
+        encoder = Gst.ElementFactory.make("vtenc_h264", f"webrtc_{name_suffix or 'out'}_vtenc")
+        pay = Gst.ElementFactory.make("rtph264pay", f"webrtc_{name_suffix or 'out'}_pay")
+
+        branch_properties: Dict[str, object] = {}
+        preview_branch = getattr(self._pipeline, "preview_branch", None)
+        if preview_branch is not None:
+            branch_properties.update(preview_branch.iter_sink_properties())
+            if preview_branch.sink_factory:
+                branch_properties.setdefault("sink_factory", preview_branch.sink_factory)
+
+        if params:
+            branch_properties.update(params)
+
+        branch_properties.setdefault("latency", 0)
+
+        sink_factory_name = str(branch_properties.pop("sink_factory", "webrtcsink") or "webrtcsink")
+        sink = Gst.ElementFactory.make(sink_factory_name, f"webrtc_{name_suffix or 'out'}_sink")
+
+        missing = [
+            label
+            for label, element in (
+                ("glupload", gl_upload),
+                ("glcolorconvert", gl_convert),
+                ("gldownload", download),
+                ("videoconvert", convert),
+                ("vtenc_h264", encoder),
+                ("rtph264pay", pay),
+                (sink_factory_name, sink),
+            )
+            if element is None
+        ]
+        if missing:
+            LOG.error("Failed to build WebRTC branch; missing elements: %s", ", ".join(missing))
+            return False
+
+        if encoder.find_property("realtime") is not None:
+            encoder.set_property("realtime", True)
+        if encoder.find_property("allow-frame-reordering") is not None:
+            encoder.set_property("allow-frame-reordering", False)
+        if encoder.find_property("max-keyframe-interval") is not None:
+            try:
+                encoder.set_property("max-keyframe-interval", 30)
+            except Exception:
+                LOG.debug("Unable to set max-keyframe-interval on %s", encoder, exc_info=True)
+        if encoder.find_property("bitrate") is not None and "bitrate" not in branch_properties:
+            try:
+                encoder.set_property("bitrate", 8_000_000)
+            except Exception:
+                LOG.debug("Unable to set bitrate on %s", encoder, exc_info=True)
+
+        payload_type_value = branch_properties.pop("payload_type", branch_properties.pop("pt", 96))
+        try:
+            pay.set_property("pt", int(payload_type_value))
+        except Exception:
+            LOG.debug(
+                "Failed to set RTP payload type to %s; using default.",
+                payload_type_value,
+                exc_info=True,
+            )
+        if pay.find_property("config-interval") is not None:
+            pay.set_property("config-interval", 1)
+
+        for element in (queue, gl_upload, gl_convert, download, convert, encoder, pay, sink):
+            pipeline.add(element)
+
+        if not self._link_many(queue, gl_upload, gl_convert, download, convert, encoder, pay, sink):
+            LOG.error("Failed to link WebRTC output branch.")
+            return False
+
+        self._apply_element_properties(sink, branch_properties)
+        return self._link_branch_to_tee(tee, queue)
 
     def _build_fallback_branch(
         self,
@@ -757,12 +904,60 @@ class GStreamerPipelineAdapter(PipelineAdapter):
         self._tee_pads.append(tee_pad)
         return True
 
-    def _make_queue(self, name: str) -> "Gst.Element":
+    def _make_queue(
+        self,
+        name: str,
+        *,
+        max_time_ns: Optional[int] = None,
+        max_buffers: int = 0,
+        max_bytes: int = 0,
+        leaky: int = 2,
+    ) -> "Gst.Element":
         queue = Gst.ElementFactory.make("queue", name)
         if not queue:
             raise RuntimeError("Failed to create queue element.")
-        queue.set_property("max-size-buffers", 0)
-        queue.set_property("max-size-bytes", 0)
-        queue.set_property("max-size-time", 5 * Gst.SECOND)
-        queue.set_property("leaky", 2)
+        queue.set_property("max-size-buffers", int(max_buffers))
+        queue.set_property("max-size-bytes", int(max_bytes))
+        if max_time_ns is None:
+            queue.set_property("max-size-time", 5 * Gst.SECOND)
+        else:
+            queue.set_property("max-size-time", max(0, int(max_time_ns)))
+        queue.set_property("leaky", int(leaky))
+        if queue.find_property("flush-on-eos") is not None:
+            queue.set_property("flush-on-eos", True)
         return queue
+
+    def _link_many(self, *elements: "Gst.Element") -> bool:
+        if Gst is None:
+            return False
+        for idx in range(len(elements) - 1):
+            upstream = elements[idx]
+            downstream = elements[idx + 1]
+            try:
+                if not upstream.link(downstream):
+                    LOG.debug(
+                        "Failed to link %s -> %s",
+                        upstream.get_name() if hasattr(upstream, "get_name") else upstream,
+                        downstream.get_name() if hasattr(downstream, "get_name") else downstream,
+                    )
+                    return False
+            except Exception:
+                LOG.exception("Error while linking %s to %s", upstream, downstream)
+                return False
+        return True
+
+    def _apply_element_properties(self, element: "Gst.Element", properties: Dict[str, object]) -> None:
+        if Gst is None or not properties:
+            return
+        for key, value in properties.items():
+            if value is None:
+                continue
+            try:
+                element.set_property(key, value)
+            except Exception:
+                LOG.debug(
+                    "Failed to set property '%s' on element %s; ignoring override.",
+                    key,
+                    element.get_name() if hasattr(element, "get_name") else element,
+                    exc_info=True,
+                )

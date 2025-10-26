@@ -805,11 +805,51 @@ class RealtimeManager:
             )
             return
 
+        rev_value = None
+        for key in ("expected_rev", "expectedRev", "rev"):
+            if key in payload:
+                rev_value = payload.get(key)
+                break
+        if rev_value is None:
+            await session.send(
+                {
+                    "type": "transport-error",
+                    "commandId": command_id,
+                    "payload": {
+                        "code": "E_INVALID_PAYLOAD",
+                        "message": "transport-command requires payload.expected_rev",
+                    },
+                }
+            )
+            return
+
         try:
-            rev_value = payload.get("rev")
-            expected_rev = int(rev_value) if rev_value is not None else None
+            expected_rev = int(rev_value)
         except (TypeError, ValueError):
-            expected_rev = None
+            await session.send(
+                {
+                    "type": "transport-error",
+                    "commandId": command_id,
+                    "payload": {
+                        "code": "E_INVALID_PAYLOAD",
+                        "message": "payload.expected_rev must be an integer",
+                    },
+                }
+            )
+            return
+
+        if expected_rev < 0:
+            await session.send(
+                {
+                    "type": "transport-error",
+                    "commandId": command_id,
+                    "payload": {
+                        "code": "E_INVALID_PAYLOAD",
+                        "message": "payload.expected_rev must be non-negative",
+                    },
+                }
+            )
+            return
 
         position_us = self._extract_position_us(payload)
         rate_value = self._extract_rate(payload)
@@ -1081,7 +1121,7 @@ def create_app(
         try:
             snapshot_dict = engine_state.apply_transport_command(
                 payload.op,
-                rev=payload.rev,
+                rev=payload.expected_rev,
                 position_us=payload.position_us,
                 rate=payload.rate,
             )

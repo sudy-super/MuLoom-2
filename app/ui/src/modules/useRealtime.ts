@@ -313,9 +313,27 @@ export function useRealtime(role: 'viewer' | 'controller', handlers: RealtimeHan
         commandId,
       };
 
-      if (typeof command.rev === 'number' && Number.isFinite(command.rev)) {
-        payload.rev = Number(command.rev);
+      const expectedRevCandidates = [
+        command.expected_rev,
+        command.expectedRev,
+        command.rev,
+      ];
+      let resolvedExpectedRev: number | undefined;
+      for (const candidate of expectedRevCandidates) {
+        if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+          resolvedExpectedRev = Number(candidate);
+          break;
+        }
       }
+      if (typeof resolvedExpectedRev !== 'number' || !Number.isFinite(resolvedExpectedRev)) {
+        const currentRev = transportRef.current.rev;
+        if (typeof currentRev === 'number' && Number.isFinite(currentRev)) {
+          resolvedExpectedRev = currentRev;
+        }
+      }
+      const normalisedExpectedRev = Math.max(0, Math.round(Number(resolvedExpectedRev ?? 0)));
+      payload.expected_rev = normalisedExpectedRev;
+      payload.rev = normalisedExpectedRev;
 
       const positionCandidates = [
         command.position_us,

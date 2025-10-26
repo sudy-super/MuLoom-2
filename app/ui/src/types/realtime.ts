@@ -148,6 +148,8 @@ export interface DeckMediaStateMessagePayload<TState = DeckTimelineState> {
 
 export type TransportCommandPayload = {
   op: string;
+  expected_rev?: number;
+  expectedRev?: number;
   rev?: number;
   position_us?: number;
   positionUs?: number;
