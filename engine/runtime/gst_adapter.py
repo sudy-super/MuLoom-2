@@ -460,14 +460,17 @@ class GStreamerPipelineAdapter(PipelineAdapter):
             need_seek = previous.rev != snapshot.rev or position_changed or rate_changed
 
         if need_seek:
-            if rate_changed and not position_changed:
-                handled = self._set_rate_instant(pipeline, snapshot.rate)
-                if not handled:
-                    start_ns = max(0, int(snapshot.pos_us)) * 1000
-                    self._send_seek(pipeline, rate=snapshot.rate, start_ns=start_ns)
+            if not self._is_pipeline_seekable(pipeline):
+                LOG.debug("Skipping seek update; pipeline is not yet in a seekable state.")
+                need_seek = False
             else:
                 start_ns = max(0, int(snapshot.pos_us)) * 1000
-                self._send_seek(pipeline, rate=snapshot.rate, start_ns=start_ns)
+                if rate_changed and not position_changed:
+                    handled = self._set_rate_instant(pipeline, snapshot.rate)
+                    if not handled:
+                        self._send_seek(pipeline, rate=snapshot.rate, start_ns=start_ns)
+                else:
+                    self._send_seek(pipeline, rate=snapshot.rate, start_ns=start_ns)
 
         if previous is None or previous.playing != snapshot.playing or self._last_playing != snapshot.playing:
             target_state = Gst.State.PLAYING if snapshot.playing else Gst.State.PAUSED
@@ -479,6 +482,8 @@ class GStreamerPipelineAdapter(PipelineAdapter):
 
     def _set_rate_instant(self, pipeline: "Gst.Pipeline", rate: float) -> bool:
         if Gst is None:
+            return False
+        if not self._is_pipeline_seekable(pipeline):
             return False
         flag = getattr(Gst.SeekFlags, "INSTANT_RATE_CHANGE", None)
         if flag is None:
@@ -505,6 +510,9 @@ class GStreamerPipelineAdapter(PipelineAdapter):
             return False
 
     def _send_seek(self, pipeline: "Gst.Pipeline", *, rate: float, start_ns: int) -> None:
+        if not self._is_pipeline_seekable(pipeline):
+            LOG.debug("Skipping segment seek; pipeline is not ready (state=%s).", self._describe_pipeline_state(pipeline))
+            return
         flags = (
             Gst.SeekFlags.FLUSH
             | Gst.SeekFlags.ACCURATE
@@ -538,6 +546,28 @@ class GStreamerPipelineAdapter(PipelineAdapter):
                 LOG.warning("Pipeline rejected seek event for transport update.")
         except Exception:  # pragma: no cover - defensive
             LOG.exception("Failed to dispatch seek event to pipeline.")
+
+    def _describe_pipeline_state(self, pipeline: "Gst.Pipeline") -> str:
+        if Gst is None:
+            return "unknown"
+        try:
+            state, _, _ = pipeline.get_state(0)
+            if hasattr(state, "value_nick"):
+                return str(state.value_nick)
+            return str(state)
+        except Exception:
+            LOG.debug("Failed to query pipeline state.", exc_info=True)
+            return "unknown"
+
+    def _is_pipeline_seekable(self, pipeline: "Gst.Pipeline") -> bool:
+        if Gst is None:
+            return False
+        try:
+            state, _, _ = pipeline.get_state(0)
+        except Exception:
+            LOG.debug("Unable to determine pipeline state for seek eligibility.", exc_info=True)
+            return False
+        return state in {Gst.State.PAUSED, Gst.State.PLAYING}
 
     # -------------------------------------------------------------- deck builds
 
@@ -785,19 +815,6 @@ class GStreamerPipelineAdapter(PipelineAdapter):
         *,
         name_suffix: Optional[str],
     ) -> bool:
-        queue = self._make_queue(
-            f"webrtc_{name_suffix or 'out'}_queue",
-            max_time_ns=int(0.75 * Gst.SECOND),
-            max_buffers=30,
-            leaky=2,
-        )
-        gl_upload = Gst.ElementFactory.make("glupload", f"webrtc_{name_suffix or 'out'}_glupload")
-        gl_convert = Gst.ElementFactory.make("glcolorconvert", f"webrtc_{name_suffix or 'out'}_glconvert")
-        download = Gst.ElementFactory.make("gldownload", f"webrtc_{name_suffix or 'out'}_gldownload")
-        convert = Gst.ElementFactory.make("videoconvert", f"webrtc_{name_suffix or 'out'}_convert")
-        encoder = Gst.ElementFactory.make("vtenc_h264", f"webrtc_{name_suffix or 'out'}_vtenc")
-        pay = Gst.ElementFactory.make("rtph264pay", f"webrtc_{name_suffix or 'out'}_pay")
-
         branch_properties: Dict[str, object] = {}
         preview_branch = getattr(self._pipeline, "preview_branch", None)
         if preview_branch is not None:
@@ -811,41 +828,59 @@ class GStreamerPipelineAdapter(PipelineAdapter):
         branch_properties.setdefault("latency", 0)
 
         sink_factory_name = str(branch_properties.pop("sink_factory", "webrtcsink") or "webrtcsink")
+
+        queue = self._make_queue(
+            f"webrtc_{name_suffix or 'out'}_queue",
+            max_time_ns=int(0.75 * Gst.SECOND),
+            max_buffers=30,
+            leaky=2,
+        )
+        gl_caps = Gst.ElementFactory.make("capsfilter", f"webrtc_{name_suffix or 'out'}_glcaps")
+        gl_convert = Gst.ElementFactory.make(
+            "glcolorconvert", f"webrtc_{name_suffix or 'out'}_glconvert"
+        )
+        download = Gst.ElementFactory.make("gldownload", f"webrtc_{name_suffix or 'out'}_gldownload")
+        convert = Gst.ElementFactory.make("videoconvert", f"webrtc_{name_suffix or 'out'}_convert")
+        encoder = self._create_h264_encoder(name_suffix=name_suffix)
+        parser = Gst.ElementFactory.make("h264parse", f"webrtc_{name_suffix or 'out'}_parse")
+        pay = Gst.ElementFactory.make("rtph264pay", f"webrtc_{name_suffix or 'out'}_pay")
         sink = Gst.ElementFactory.make(sink_factory_name, f"webrtc_{name_suffix or 'out'}_sink")
 
         missing = [
             label
             for label, element in (
-                ("glupload", gl_upload),
                 ("glcolorconvert", gl_convert),
                 ("gldownload", download),
                 ("videoconvert", convert),
-                ("vtenc_h264", encoder),
+                ("h264_encoder", encoder),
                 ("rtph264pay", pay),
                 (sink_factory_name, sink),
             )
             if element is None
         ]
+
         if missing:
             LOG.error("Failed to build WebRTC branch; missing elements: %s", ", ".join(missing))
             return False
 
-        if encoder.find_property("realtime") is not None:
-            encoder.set_property("realtime", True)
-        if encoder.find_property("allow-frame-reordering") is not None:
-            encoder.set_property("allow-frame-reordering", False)
-        if encoder.find_property("max-keyframe-interval") is not None:
+        if gl_caps is not None:
             try:
-                encoder.set_property("max-keyframe-interval", 30)
+                gl_caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:GLMemory)"))
             except Exception:
-                LOG.debug("Unable to set max-keyframe-interval on %s", encoder, exc_info=True)
-        if encoder.find_property("bitrate") is not None and "bitrate" not in branch_properties:
-            try:
-                encoder.set_property("bitrate", 8_000_000)
-            except Exception:
-                LOG.debug("Unable to set bitrate on %s", encoder, exc_info=True)
+                LOG.debug("Failed to set GL capsfilter; continuing without explicit caps.", exc_info=True)
 
-        payload_type_value = branch_properties.pop("payload_type", branch_properties.pop("pt", 96))
+        elements: List["Gst.Element"] = [queue]
+        if gl_caps is not None:
+            elements.append(gl_caps)
+        elements.extend([gl_convert, download, convert, encoder])
+        if parser:
+            if parser.find_property("config-interval") is not None:
+                parser.set_property("config-interval", 1)
+            if parser.find_property("update-dts") is not None:
+                parser.set_property("update-dts", True)
+            elements.append(parser)
+
+        payload_type_value = branch_properties.get("payload_type", branch_properties.get("pt", 96))
         try:
             pay.set_property("pt", int(payload_type_value))
         except Exception:
@@ -856,16 +891,35 @@ class GStreamerPipelineAdapter(PipelineAdapter):
             )
         if pay.find_property("config-interval") is not None:
             pay.set_property("config-interval", 1)
+        elements.extend([pay, sink])
 
-        for element in (queue, gl_upload, gl_convert, download, convert, encoder, pay, sink):
+        for element in elements:
             pipeline.add(element)
 
-        if not self._link_many(queue, gl_upload, gl_convert, download, convert, encoder, pay, sink):
-            LOG.error("Failed to link WebRTC output branch.")
+        link_chain: List["Gst.Element"] = [queue]
+        if gl_caps is not None:
+            link_chain.append(gl_caps)
+        link_chain.extend([gl_convert, download, convert, encoder])
+        if parser:
+            link_chain.append(parser)
+        link_chain.extend([pay, sink])
+
+        if not self._link_many(*link_chain):
+            LOG.error("Failed to link WebRTC branch.")
+            self._cleanup_elements(pipeline, elements)
             return False
 
-        self._apply_element_properties(sink, branch_properties)
-        return self._link_branch_to_tee(tee, queue)
+        sink_properties = dict(branch_properties)
+        sink_properties.pop("payload_type", None)
+        sink_properties.pop("pt", None)
+        self._apply_element_properties(sink, sink_properties)
+
+        if not self._link_branch_to_tee(tee, queue):
+            LOG.error("Failed to connect WebRTC branch to tee.")
+            self._cleanup_elements(pipeline, elements)
+            return False
+
+        return True
 
     def _build_fallback_branch(
         self,
@@ -961,3 +1015,78 @@ class GStreamerPipelineAdapter(PipelineAdapter):
                     element.get_name() if hasattr(element, "get_name") else element,
                     exc_info=True,
                 )
+
+    def _cleanup_elements(self, pipeline: "Gst.Pipeline", elements: List["Gst.Element"]) -> None:
+        if Gst is None:
+            return
+        for element in elements:
+            if element is None:
+                continue
+            try:
+                element.set_state(Gst.State.NULL)
+            except Exception:
+                LOG.debug("Failed to set element %s to NULL during cleanup.", element, exc_info=True)
+            try:
+                pipeline.remove(element)
+            except Exception:
+                LOG.debug("Failed to remove element %s during cleanup.", element, exc_info=True)
+
+    def _create_h264_encoder(self, *, name_suffix: Optional[str]) -> Optional["Gst.Element"]:
+        if Gst is None:
+            return None
+
+        candidates: List[Tuple[str, Dict[str, object]]] = [
+            ("vtenc_h264", {"realtime": True, "allow-frame-reordering": False, "bitrate": 8_000_000}),
+            (
+                "x264enc",
+                {
+                    "speed-preset": "ultrafast",
+                    "tune": "zerolatency",
+                    "key-int-max": 30,
+                    "bitrate": 8_000,
+                },
+            ),
+            (
+                "vaapih264enc",
+                {
+                    "rate-control": "cbr",
+                    "bitrate": 8_000,
+                    "keyframe-period": 30,
+                },
+            ),
+            ("openh264enc", {"bitrate": 8_000_000, "max-framesize": 0}),
+        ]
+
+        for factory_name, properties in candidates:
+            element = Gst.ElementFactory.make(
+                factory_name, f"webrtc_{name_suffix or 'out'}_{factory_name}"
+            )
+            if not element:
+                continue
+
+            for key, value in properties.items():
+                if element.find_property(key) is None:
+                    continue
+                try:
+                    element.set_property(key, value)
+                except Exception:
+                    LOG.debug(
+                        "Failed to set property '%s'=%s on %s",
+                        key,
+                        value,
+                        factory_name,
+                        exc_info=True,
+                    )
+
+            if element.find_property("latency") is not None:
+                try:
+                    element.set_property("latency", 0)
+                except Exception:
+                    LOG.debug("Unable to set latency on %s", factory_name, exc_info=True)
+            return element
+
+        LOG.error(
+            "No supported H.264 encoder factory found (candidates: %s).",
+            ", ".join(name for name, _ in candidates),
+        )
+        return None

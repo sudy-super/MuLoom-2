@@ -8,6 +8,7 @@
 - Resolved a runtime regression by replacing `Gst.Element.link_many` calls with an internal helper for broader gi bindings compatibility.
 - Added a macOS-only `muloom_gpu` Tauriプラグイン that初期化する Metal バックエンドの `wgpu` レンダラをバックグラウンドスレッドで起動し、センターディスプレイ描画を GPU 直叩きに切り替え。
 - Stabilised WebRTCプレビューの自動再生ロジック（既存ストリーム再割り当て時の `play()` 中断を回避）でブラウザの AbortError を防止。
-- Patched WebRTC 出力枝に `glupload → glcolorconvert` を追加し、GL メモリ経由で `gldownload` へ受け渡す構成とすることでリンクエラーを解消。
+- WebRTC 出力枝を `queue → glupload → glcolorconvert → gldownload → videoconvert → H.264 encoder → h264parse → rtph264pay → webrtcsink` に再構築し、GL パスが使えない環境では自動的に CPU パスへフォールバック、H.264 エンコーダも vtenc/x264/VAAPI/openh264 の順に切り替えるようにした。
+- トランスポート更新時の SEEK が許容状態のみで発行されるようパイプライン状態を確認し、INSTANT_RATE_CHANGE → セグメント SEEK の順で再適用。
 - Tightened WebRTC latency by constraining per-branch queue depth, defaulting sink latency to `0`, and capping VideoToolbox keyframe interval/bitrate for smoother synchronisation with the centre display.
 - Tests: `pytest` (14 tests) & `cargo check` (app/src-tauri) on 2025-10-26.
