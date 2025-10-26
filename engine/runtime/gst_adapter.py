@@ -827,31 +827,68 @@ class GStreamerPipelineAdapter(PipelineAdapter):
 
         branch_properties.setdefault("latency", 0)
 
-        sink_factory_name = str(branch_properties.pop("sink_factory", "webrtcsink") or "webrtcsink")
+        sink_factory_name = str(branch_properties.get("sink_factory", "webrtcsink") or "webrtcsink")
+        branch_properties.pop("sink_factory", None)
 
+        suffix = name_suffix or "out"
+
+        if self._build_webrtc_branch_gl(
+            pipeline=pipeline,
+            tee=tee,
+            suffix=suffix,
+            sink_factory_name=sink_factory_name,
+            branch_properties=dict(branch_properties),
+        ):
+            return True
+
+        LOG.warning(
+            "Failed to construct GL-backed WebRTC branch '%s'; falling back to CPU path.",
+            suffix,
+        )
+
+        return self._build_webrtc_branch_cpu(
+            pipeline=pipeline,
+            tee=tee,
+            suffix=suffix,
+            sink_factory_name=sink_factory_name,
+            branch_properties=dict(branch_properties),
+        )
+
+    def _build_webrtc_branch_gl(
+        self,
+        *,
+        pipeline: "Gst.Pipeline",
+        tee: "Gst.Element",
+        suffix: str,
+        sink_factory_name: str,
+        branch_properties: Dict[str, object],
+    ) -> bool:
         queue = self._make_queue(
-            f"webrtc_{name_suffix or 'out'}_queue",
+            f"webrtc_{suffix}_queue",
             max_time_ns=int(0.75 * Gst.SECOND),
             max_buffers=30,
             leaky=2,
         )
-        gl_caps = Gst.ElementFactory.make("capsfilter", f"webrtc_{name_suffix or 'out'}_glcaps")
-        gl_convert = Gst.ElementFactory.make(
-            "glcolorconvert", f"webrtc_{name_suffix or 'out'}_glconvert"
-        )
-        download = Gst.ElementFactory.make("gldownload", f"webrtc_{name_suffix or 'out'}_gldownload")
-        convert = Gst.ElementFactory.make("videoconvert", f"webrtc_{name_suffix or 'out'}_convert")
-        encoder = self._create_h264_encoder(name_suffix=name_suffix)
-        parser = Gst.ElementFactory.make("h264parse", f"webrtc_{name_suffix or 'out'}_parse")
-        pay = Gst.ElementFactory.make("rtph264pay", f"webrtc_{name_suffix or 'out'}_pay")
-        sink = Gst.ElementFactory.make(sink_factory_name, f"webrtc_{name_suffix or 'out'}_sink")
+        upload = Gst.ElementFactory.make("glupload", f"webrtc_{suffix}_upload")
+        gl_convert = Gst.ElementFactory.make("glcolorconvert", f"webrtc_{suffix}_glconvert")
+        gl_caps = Gst.ElementFactory.make("capsfilter", f"webrtc_{suffix}_glcaps")
+        download = Gst.ElementFactory.make("gldownload", f"webrtc_{suffix}_gldownload")
+        convert = Gst.ElementFactory.make("videoconvert", f"webrtc_{suffix}_convert")
+        cpu_caps = Gst.ElementFactory.make("capsfilter", f"webrtc_{suffix}_cpu_caps")
+        encoder = self._create_h264_encoder(name_suffix=suffix)
+        parser = Gst.ElementFactory.make("h264parse", f"webrtc_{suffix}_parse")
+        pay = Gst.ElementFactory.make("rtph264pay", f"webrtc_{suffix}_pay")
+        sink = Gst.ElementFactory.make(sink_factory_name, f"webrtc_{suffix}_sink")
 
         missing = [
             label
             for label, element in (
+                ("glupload", upload),
                 ("glcolorconvert", gl_convert),
+                ("glcaps", gl_caps),
                 ("gldownload", download),
                 ("videoconvert", convert),
+                ("capsfilter", cpu_caps),
                 ("h264_encoder", encoder),
                 ("rtph264pay", pay),
                 (sink_factory_name, sink),
@@ -860,26 +897,178 @@ class GStreamerPipelineAdapter(PipelineAdapter):
         ]
 
         if missing:
-            LOG.error("Failed to build WebRTC branch; missing elements: %s", ", ".join(missing))
+            LOG.error(
+                "Missing required elements for GL-backed WebRTC branch (%s).",
+                ", ".join(missing),
+            )
+            if encoder:
+                try:
+                    pipeline.remove(encoder)
+                except Exception:
+                    pass
             return False
 
-        if gl_caps is not None:
-            try:
+        try:
+            if gl_caps is not None:
                 gl_caps.set_property("caps", Gst.Caps.from_string("video/x-raw(memory:GLMemory)"))
-            except Exception:
-                LOG.debug("Failed to set GL capsfilter; continuing without explicit caps.", exc_info=True)
+            cpu_caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=NV12"))
+        except Exception:
+            LOG.debug("Failed to constrain CPU caps to NV12; continuing with defaults.", exc_info=True)
 
-        elements: List["Gst.Element"] = [queue]
-        if gl_caps is not None:
-            elements.append(gl_caps)
-        elements.extend([gl_convert, download, convert, encoder])
+        self._configure_h264_parser(parser)
+        self._configure_h264_payloader(pay, branch_properties)
+
+        elements: List["Gst.Element"] = [
+            queue,
+            upload,
+            gl_convert,
+            gl_caps,
+            download,
+            convert,
+            cpu_caps,
+            encoder,
+            pay,
+            sink,
+        ]
         if parser:
-            if parser.find_property("config-interval") is not None:
-                parser.set_property("config-interval", 1)
-            if parser.find_property("update-dts") is not None:
-                parser.set_property("update-dts", True)
-            elements.append(parser)
+            elements.insert(elements.index(encoder) + 1, parser)
 
+        for element in elements:
+            if element:
+                pipeline.add(element)
+
+        link_chain: List["Gst.Element"] = [
+            queue,
+            upload,
+            gl_convert,
+            gl_caps,
+            download,
+            convert,
+            cpu_caps,
+            encoder,
+        ]
+        if parser:
+            link_chain.append(parser)
+        link_chain.extend([pay, sink])
+
+        if not self._link_many(*link_chain):
+            LOG.error("Failed to link GL-backed WebRTC branch.")
+            self._cleanup_elements(pipeline, elements)
+            return False
+
+        self._apply_webrtc_sink_properties(sink, branch_properties)
+
+        if not self._link_branch_to_tee(tee, queue):
+            LOG.error("Failed to connect GL-backed WebRTC branch to tee.")
+            self._cleanup_elements(pipeline, elements)
+            return False
+
+        return True
+
+    def _build_webrtc_branch_cpu(
+        self,
+        *,
+        pipeline: "Gst.Pipeline",
+        tee: "Gst.Element",
+        suffix: str,
+        sink_factory_name: str,
+        branch_properties: Dict[str, object],
+    ) -> bool:
+        queue = self._make_queue(
+            f"webrtc_{suffix}_cpu_queue",
+            max_time_ns=int(0.75 * Gst.SECOND),
+            max_buffers=30,
+            leaky=2,
+        )
+        convert = Gst.ElementFactory.make("videoconvert", f"webrtc_{suffix}_cpu_convert")
+        caps = Gst.ElementFactory.make("capsfilter", f"webrtc_{suffix}_cpu_caps")
+        encoder = self._create_h264_encoder(name_suffix=f"{suffix}_cpu")
+        parser = Gst.ElementFactory.make("h264parse", f"webrtc_{suffix}_cpu_parse")
+        pay = Gst.ElementFactory.make("rtph264pay", f"webrtc_{suffix}_cpu_pay")
+        sink = Gst.ElementFactory.make(sink_factory_name, f"webrtc_{suffix}_cpu_sink")
+
+        missing = [
+            label
+            for label, element in (
+                ("videoconvert", convert),
+                ("capsfilter", caps),
+                ("h264_encoder", encoder),
+                ("rtph264pay", pay),
+                (sink_factory_name, sink),
+            )
+            if element is None
+        ]
+        if missing:
+            LOG.error(
+                "Missing required elements for CPU-only WebRTC branch (%s).",
+                ", ".join(missing),
+            )
+            if encoder:
+                try:
+                    pipeline.remove(encoder)
+                except Exception:
+                    pass
+            return False
+
+        try:
+            caps.set_property("caps", Gst.Caps.from_string("video/x-raw,format=NV12"))
+        except Exception:
+            LOG.debug("Failed to constrain CPU fallback caps; continuing with defaults.", exc_info=True)
+
+        self._configure_h264_parser(parser)
+        self._configure_h264_payloader(pay, branch_properties)
+
+        elements: List["Gst.Element"] = [
+            queue,
+            convert,
+            caps,
+            encoder,
+            pay,
+            sink,
+        ]
+        if parser:
+            elements.insert(elements.index(encoder) + 1, parser)
+
+        for element in elements:
+            if element:
+                pipeline.add(element)
+
+        link_chain: List["Gst.Element"] = [queue, convert, caps, encoder]
+        if parser:
+            link_chain.append(parser)
+        link_chain.extend([pay, sink])
+
+        if not self._link_many(*link_chain):
+            LOG.error("Failed to link CPU-only WebRTC branch.")
+            self._cleanup_elements(pipeline, elements)
+            return False
+
+        self._apply_webrtc_sink_properties(sink, branch_properties)
+
+        if not self._link_branch_to_tee(tee, queue):
+            LOG.error("Failed to connect CPU-only WebRTC branch to tee.")
+            self._cleanup_elements(pipeline, elements)
+            return False
+
+        return True
+
+    def _configure_h264_parser(self, parser: Optional["Gst.Element"]) -> None:
+        if parser is None:
+            return
+        if parser.find_property("config-interval") is not None:
+            parser.set_property("config-interval", 1)
+        if parser.find_property("update-dts") is not None:
+            parser.set_property("update-dts", True)
+        if parser.find_property("alignment") is not None:
+            parser.set_property("alignment", "au")
+
+    def _configure_h264_payloader(
+        self,
+        pay: Optional["Gst.Element"],
+        branch_properties: Dict[str, object],
+    ) -> None:
+        if pay is None:
+            return
         payload_type_value = branch_properties.get("payload_type", branch_properties.get("pt", 96))
         try:
             pay.set_property("pt", int(payload_type_value))
@@ -891,35 +1080,29 @@ class GStreamerPipelineAdapter(PipelineAdapter):
             )
         if pay.find_property("config-interval") is not None:
             pay.set_property("config-interval", 1)
-        elements.extend([pay, sink])
 
-        for element in elements:
-            pipeline.add(element)
-
-        link_chain: List["Gst.Element"] = [queue]
-        if gl_caps is not None:
-            link_chain.append(gl_caps)
-        link_chain.extend([gl_convert, download, convert, encoder])
-        if parser:
-            link_chain.append(parser)
-        link_chain.extend([pay, sink])
-
-        if not self._link_many(*link_chain):
-            LOG.error("Failed to link WebRTC branch.")
-            self._cleanup_elements(pipeline, elements)
-            return False
+    def _apply_webrtc_sink_properties(
+        self,
+        sink: Optional["Gst.Element"],
+        branch_properties: Dict[str, object],
+    ) -> None:
+        if sink is None:
+            return
 
         sink_properties = dict(branch_properties)
+        if "video_caps" in sink_properties and "video-caps" not in sink_properties:
+            sink_properties["video-caps"] = sink_properties.pop("video_caps")
         sink_properties.pop("payload_type", None)
         sink_properties.pop("pt", None)
+        sink_properties.pop("sink_factory", None)
+
         self._apply_element_properties(sink, sink_properties)
 
-        if not self._link_branch_to_tee(tee, queue):
-            LOG.error("Failed to connect WebRTC branch to tee.")
-            self._cleanup_elements(pipeline, elements)
-            return False
-
-        return True
+        if sink.find_property("video-caps") is not None and "video-caps" not in sink_properties:
+            try:
+                sink.set_property("video-caps", Gst.Caps.from_string("video/x-h264"))
+            except Exception:
+                LOG.debug("Failed to set default video-caps on WebRTC sink.", exc_info=True)
 
     def _build_fallback_branch(
         self,
@@ -946,14 +1129,19 @@ class GStreamerPipelineAdapter(PipelineAdapter):
         if not pipeline:
             return False
         sink_pad = queue.get_static_pad("sink")
+        if sink_pad.is_linked():
+            return True
+
         tee_pad = tee.get_request_pad("src_%u")
         if not tee_pad:
             LOG.error("Failed to request tee src pad.")
             return False
-        if sink_pad.is_linked():
-            return True
         if tee_pad.link(sink_pad) != Gst.PadLinkReturn.OK:
             LOG.error("Failed to link tee to branch.")
+            try:
+                tee.release_request_pad(tee_pad)
+            except Exception:
+                LOG.debug("Failed to release tee pad after unsuccessful link.", exc_info=True)
             return False
         self._tee_pads.append(tee_pad)
         return True
@@ -1036,14 +1224,29 @@ class GStreamerPipelineAdapter(PipelineAdapter):
             return None
 
         candidates: List[Tuple[str, Dict[str, object]]] = [
-            ("vtenc_h264", {"realtime": True, "allow-frame-reordering": False, "bitrate": 8_000_000}),
+            (
+                "vtenc_h264",
+                {
+                    "realtime": True,
+                    "allow-frame-reordering": False,
+                    "max-keyframe-interval": 60,
+                },
+            ),
             (
                 "x264enc",
                 {
-                    "speed-preset": "ultrafast",
+                    "speed-preset": "superfast",
                     "tune": "zerolatency",
-                    "key-int-max": 30,
+                    "key-int-max": 60,
+                    "byte-stream": True,
                     "bitrate": 8_000,
+                },
+            ),
+            (
+                "openh264enc",
+                {
+                    "gop-size": 60,
+                    "bitrate": 8_000_000,
                 },
             ),
             (
@@ -1051,10 +1254,9 @@ class GStreamerPipelineAdapter(PipelineAdapter):
                 {
                     "rate-control": "cbr",
                     "bitrate": 8_000,
-                    "keyframe-period": 30,
+                    "keyframe-period": 60,
                 },
             ),
-            ("openh264enc", {"bitrate": 8_000_000, "max-framesize": 0}),
         ]
 
         for factory_name, properties in candidates:
